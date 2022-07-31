@@ -1,0 +1,115 @@
+
+" インクリメンタル検索 (検索ワードの最初の文字を入力した時点で検索が開始)
+set incsearch
+
+" 検索対象をハイライト
+set hlsearch
+
+" ステータス行を常に表示
+set laststatus=2
+
+" ヤンクでクリップボードにコピー
+set clipboard+=unnamed
+
+" 対応する括弧を強調表示
+set showmatch
+
+" ignorecase + smartcase	小文字に対して大文字小文字を無視	大文字に対して普通の検索(大文字小文字を無視しない)
+set ignorecase
+
+set smartcase
+
+set wildmenu
+
+" set relativenumber
+
+set backspace=indent,eol,start
+
+set scrolloff=999
+
+------------------------------------------------------------
+set easymotion
+
+nmap s <Plug>(easymotion-s2)
+" vnoremap s <Plug>(easymotion-s2)
+vmap s <Plug>(easymotion-s2)
+
+
+"ノーマルモード中にEnterで改行
+noremap <CR> i<CR><Esc>
+
+" xやsでヤンクしない
+nnoremap x "_x
+" nnoremap s "_s
+
+" j, k による移動を折り返されたテキストでも自然に振る舞うように変更
+nnoremap j gj
+nnoremap k gk
+
+" These create newlines like o and O but stay in normal mode
+nmap zj o<Esc>k
+nmap zk O<Esc>j
+
+" Escの2回押しでハイライト消去
+nnoremap <Esc><Esc> :nohlsearch<CR><ESC>
+
+inoremap jj <ESC>
+
+noremap j gj
+noremap k gk
+noremap <Space>h ^
+noremap <Space>l $
+
+" go terminal 二つ書いてるけどどっちか一つで良い
+" terminalからコードにもどる時は、terminal内でEsc
+nnoremap gt :<C-u>action ActivateTerminalToolWindow<CR>
+nnoremap gu :<C-u>action ActivateTerminalToolWindow<CR>
+
+nnoremap <C-o> :<C-u>action Back<CR>
+nnoremap <C-i> :<C-u>action Forward<CR>
+
+nnoremap g; :<C-u>action JumpToLastChange<CR>
+nnoremap g, :<C-u>action JumpToNextChange<CR>
+
+nmap <Space><Space>f :action GotoFile<CR>
+nnoremap <Space>c :action GotoClass<CR>
+
+" Jump to Last window 
+nmap <Space>ww :action JumpToLastWindow<cr>
+
+nmap <Space>wl <C-w>l
+nmap <Space>wh <C-w>h
+
+nmap <Space>f :action SelectInProjectView<cr>
+
+" FileStructure
+nmap <Space>; :action FileStructurePopup<cr>
+
+" 便利
+nmap <Space>re :action Rerun<cr>
+
+nmap <Space>ru :action Run<cr>
+
+" カーソルのあるクラスのRun
+nnoremap <Space>rc :<C-u>action RunClass<CR>
+
+nmap <Space>dd :action Debug<cr>
+
+nmap <Space>dc :action Resume<cr>
+
+" toggle breakpoint
+nnoremap <Space>b :<C-u>action ToggleLineBreakpoint<CR>
+
+" go impl 
+nnoremap <Space>gi :action GotoImplementation<CR>
+
+" go super 
+nnoremap <Space>gs :action GotoSuperMethod<CR>
+
+" テストファイルに行ってくれる
+nmap <Space>gt :action GotoTest<cr>
+
+noremap gl gt
+noremap gh gT
+
+" cmd 1 で Projectに行けるので開いて閉じる動作をできないか
