@@ -1,0 +1,171 @@
+{
+  "editor.suggestSelection": "first",
+  "vsintellicode.modify.editor.suggestSelection": "automaticallyOverrodeDefaultValue",
+  "files.autoSave": "afterDelay",
+  "editor.fontSize": 14,
+  "editor.tabSize": 2,
+  "editor.wordWrap": "on",
+  // "powermode.enabled": true,
+  // "editor.lineHighlightBackground": "#1E1E1EAA",
+  // "powermode.presets": "particles",
+  // "powermode.enableShake": false,
+  // "powermode.enableStatusBarComboCounter": true,
+  "vim.easymotion": true,
+  "vim.incsearch": true,
+  "vim.easymotionMarkerForegroundColorOneChar": "rgba(0,240,170,0.9)", //一文字目の色
+  "vim.useSystemClipboard": true,
+  "vim.useCtrlKeys": true,
+  "vim.hlsearch": true,
+  // * で配下の単語を検索してくれる
+  "vim.visualstar": true,
+  // 折り畳まれた場所を展開しないで乗り越える
+  "vim.foldfix": true,
+  //zen mode settings
+
+  "zenMode.fullScreen": true,
+  "zenMode.centerLayout": true,
+  "zenMode.hideActivityBar": true,
+  "zenMode.hideLineNumbers": false,
+  "zenMode.hideTabs": false,
+  "zenMode.hideStatusBar": true,
+  "zenMode.restore": false,
+
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+
+  "[javascript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "editor.formatOnSave": true,
+
+  "scrolloff.alwaysCenter": true,
+
+  "vim.normalModeKeyBindingsNonRecursive": [
+    {
+      "before": ["z", "z"],
+      "after": [],
+      "commands": [
+        {
+          "command": "workbench.action.toggleZenMode",
+          "args": []
+        }
+      ]
+    },
+    {
+      "before": ["s"],
+      "after": ["<leader>", "<leader>", "2", "s", "<char>", "<char>"]
+    },
+    {
+      "before": ["j"],
+      "after": ["g", "j"]
+    },
+    {
+      "before": ["k"],
+      "after": ["g", "k"]
+    },
+    {
+      "before": ["g", "l"],
+      "after": ["g", "t"]
+    },
+    {
+      "before": ["g", "h"],
+      "after": ["g", "T"]
+    },
+    {
+      "before": ["<space>", "h"],
+      "after": ["^"]
+    },
+    {
+      "before": ["<space>", "l"],
+      "after": ["$"]
+    },
+    {
+      "before": ["<C-o>"],
+      "commands": [
+        {
+          "command": "workbench.action.navigateBack"
+        }
+      ]
+    },
+    {
+      "before": ["<C-i>"],
+      "commands": [
+        {
+          "command": "workbench.action.navigateForward"
+        }
+      ]
+    },
+    {
+      "before": ["<Esc>", "<Esc>"],
+      "after": [":nohl"]
+    }
+  ],
+  "vim.insertModeKeyBindings": [
+    {
+      "before": ["j", "j"],
+      "after": ["<Esc>"]
+    }
+  ],
+  "vim.leader": "<space>",
+  "vim.handleKeys": {
+    "<C-a>": false,
+    "<C-f>": false
+  },
+
+  "latex-workshop.view.pdf.viewer": "tab",
+  "latex-workshop.message.update.show": false,
+  "files.exclude": {
+    "**/.classpath": true,
+    "**/.project": true,
+    // "**/.settings": true,
+    "**/.factorypath": true
+  },
+  "workbench.editorAssociations": {
+    "*.ipynb": "jupyter-notebook"
+  },
+  "workbench.iconTheme": "material-icon-theme",
+  "workbench.colorTheme": "Iceberg",
+  "git.autofetch": true,
+  "notebook.cellToolbarLocation": {
+    "default": "right",
+    "jupyter-notebook": "left"
+  },
+  "security.workspace.trust.untrustedFiles": "open",
+  "explorer.confirmDragAndDrop": false,
+  "tabnine.experimentalAutoImports": true,
+  "explorer.confirmDelete": false,
+  "prettier.arrowParens": "avoid",
+  "editor.guides.bracketPairs": true,
+  "editor.guides.bracketPairsHorizontal": true,
+  "vsicons.dontShowNewVersionMessage": true,
+  "diffEditor.codeLens": true,
+  "editor.minimap.enabled": false,
+  "editor.codeActionsOnSave": {
+    "source.organizeImports": true
+  },
+
+  "git.suggestSmartCommit": false,
+  "gitlens.remotes": [
+    {
+      "domain": "ghe.corp.domain.co.jp",
+      "type": "GitHub",
+      "name": "ghe",
+      "protocol": "https",
+      "urls": {
+        "repository": "https://ghe.corp.domain.co.jp/${repo}",
+        "branches": "https://ghe.corp.domain.co.jp/${repo}/branches",
+        "branch": "https://ghe.corp.domain.co.jp/${repo}/commits/${branch}",
+        "commit": "https://ghe.corp.domain.co.jp/${repo}/commit/${id}",
+        "file": "https://ghe.corp.domain.co.jp/${repo}?path=${file}${line}",
+        "fileInBranch": "https://ghe.corp.domain.co.jp/${repo}/blob/${branch}/${file}${line}",
+        "fileInCommit": "https://ghe.corp.domain.co.jp/${repo}/blob/${id}/${file}${line}",
+        "fileLine": "#L${line}",
+        "fileRange": "#L${start}-L${end}"
+      }
+    }
+  ],
+
+  "vscode-pets.petSize": "medium",
+  "vscode-pets.position": "explorer",
+  "vscode-pets.petColor": "green",
+  "vscode-pets.petType": "totoro"
+}
