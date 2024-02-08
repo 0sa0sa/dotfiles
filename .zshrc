@@ -38,7 +38,6 @@ alias di="docker image"
 alias dis="docker images"
 alias dc="docker container"
 
-alias b="bpctl"
 # alias kexec="kubectl exec --stdin --tty $1 -- /bin/bash"
 alias kk="kubectl kustomize"
 alias ka="kubectl apply"
