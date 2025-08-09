@@ -2,6 +2,7 @@ autoload -Uz colors
 colors
 
 autoload -U compinit
+compinit
 
 autoload predict-on
 predict-on
@@ -31,7 +32,8 @@ alias cdan="claude --dangerously-skip-permissions"
 
 alias glog="git log --oneline --decorate --graph --all"
 alias gs="git status"
-alias gss="git status -s"
+alias gss="git switch staging"
+alias gsm="git switch main"
 alias ga="git add"
 alias gc="git commit"
 
@@ -70,6 +72,8 @@ alias ka="kubectl apply"
 alias k="kubectl"
 alias ksp="k get pods -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | fzf"
 
+alias t="terraform"
+
 #alias ls='ls -G'
 alias lla='ls -laG'
 
@@ -94,6 +98,7 @@ bindkey "jj" vi-cmd-mode
 #" bashの場合
 #" bind '"jj": vi-movement-mode'
 #
+<<<<<<< Updated upstream
 
 eval "$(starship init zsh)"
 
@@ -130,3 +135,39 @@ source <(kubectl completion zsh)
 eval "$(direnv hook zsh)"
 
 . "$HOME/.local/bin/env"
+=======
+PATH="/usr/local/opt/gnu-tar/libexec/gnubin:$PATH"
+PATH="/usr/local/opt/gnu-sed/libexec/gnubin:$PATH"
+PATH="$HOME/.volta/bin:$PATH"
+eval "$(starship init zsh)"
+
+eval $(thefuck --alias)
+eval "$(/opt/homebrew/bin/mise activate zsh)"
+
+rm() {
+      for arg in "$@"; do
+          case "$arg" in
+              (/ | ~ | ~/ | ~/* | /* | *-/*)
+                  echo "Refusing to rm '$arg'"
+                  return 1
+                  ;;
+          esac
+      done
+      command rm "$@"
+  }
+
+autoload -U +X bashcompinit && bashcompinit
+complete -o nospace -C /opt/homebrew/bin/terraform terraform
+
+# The next line updates PATH for the Google Cloud SDK.
+if [ -f '~/Downloads/google-cloud-sdk/path.zsh.inc' ]; then . '~/Downloads/google-cloud-sdk/path.zsh.inc'; fi
+
+# The next line enables shell command completion for gcloud.
+if [ -f '~/Downloads/google-cloud-sdk/completion.zsh.inc' ]; then . '~/Downloads/google-cloud-sdk/completion.zsh.inc'; fi
+
+# Add fpath for completions
+fpath=(~/.zsh/completions $fpath)
+
+# Source worktree-manager script
+source ~/.zsh/worktree-manager.zsh
+>>>>>>> Stashed changes
