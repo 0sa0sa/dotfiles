@@ -98,15 +98,15 @@ bindkey "jj" vi-cmd-mode
 #" bashの場合
 #" bind '"jj": vi-movement-mode'
 #
-<<<<<<< Updated upstream
-
-eval "$(starship init zsh)"
-
-
-eval $(thefuck --alias)
 export VOLTA_HOME="$HOME/.volta"
 export PATH="$VOLTA_HOME/bin:$HOME/.local/bin:$PATH"
+export PATH="/usr/local/opt/gnu-tar/libexec/gnubin:$PATH"
+export PATH="/usr/local/opt/gnu-sed/libexec/gnubin:$PATH"
 export PATH="$HOME/.local/bin:$PATH"
+
+eval "$(starship init zsh)"
+eval $(thefuck --alias)
+eval "$(/opt/homebrew/bin/mise activate zsh)"
 
 gsw() {
   git switch "$(
@@ -115,34 +115,6 @@ gsw() {
     | awk '{print $1}'
   )"
 }
-
-rm() {
-  for arg in "$@"; do
-    case "$arg" in
-      /|~|~/|~/*|/*|*-/*) echo "Refusing to rm '$arg'"; return 1;;
-    esac
-  done
-  command rm "$@"
-}
-
-
-# The next line updates PATH for the Google Cloud SDK.
-if [ -f '~/Downloads/google-cloud-sdk/path.zsh.inc' ]; then . '~/Downloads/google-cloud-sdk/path.zsh.inc'; fi
-
-# The next line enables shell command completion for gcloud.
-if [ -f '~/Downloads/google-cloud-sdk/completion.zsh.inc' ]; then . '~/Downloads/google-cloud-sdk/completion.zsh.inc'; fi
-source <(kubectl completion zsh)
-eval "$(direnv hook zsh)"
-
-. "$HOME/.local/bin/env"
-=======
-PATH="/usr/local/opt/gnu-tar/libexec/gnubin:$PATH"
-PATH="/usr/local/opt/gnu-sed/libexec/gnubin:$PATH"
-PATH="$HOME/.volta/bin:$PATH"
-eval "$(starship init zsh)"
-
-eval $(thefuck --alias)
-eval "$(/opt/homebrew/bin/mise activate zsh)"
 
 rm() {
       for arg in "$@"; do
@@ -170,4 +142,6 @@ fpath=(~/.zsh/completions $fpath)
 
 # Source worktree-manager script
 source ~/.zsh/worktree-manager.zsh
->>>>>>> Stashed changes
+source <(kubectl completion zsh)
+eval "$(direnv hook zsh)"
+. "$HOME/.local/bin/env"
