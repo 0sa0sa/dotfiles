@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+"""herdr-slack — minimal Slack TUI for a herdr pane (xoxc/xoxd session auth).
+
+Usage:
+  herdr-slack            # launch the TUI
+  herdr-slack --setup    # store token + cookie (prompts, written with 0600)
+  herdr-slack --check    # verify auth with auth.test
+
+Keys:
+  tab        switch focus between channel list and messages
+  j/k, up/dn move selection
+  enter      open channel / open thread of selected message
+  r          reply (to channel, or to thread when inside one)
+  m          mark current channel as read
+  u          refresh current view
+  b / esc    back from thread to channel
+  q          quit
+"""
+
+import curses
+import html
+import json
+import os
+import re
+import sys
+import textwrap
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+
+class RateLimiter:
+    """Token bucket shared across all threads: caps sustained request rate
+    while allowing a small burst. A safety valve against runaway/DDoS-y
+    request storms, not a throttle on normal use (warm cache makes ~0 calls)."""
+
+    def __init__(self, rate, burst):
+        self.rate = rate
+        self.capacity = burst
+        self.tokens = burst
+        self.updated = time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self):
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+                self.updated = now
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+                wait = (1 - self.tokens) / self.rate
+            time.sleep(min(wait, 1.0))
+
+CONF_DIR = os.path.expanduser("~/.config/herdr-slack")
+CONF_PATH = os.path.join(CONF_DIR, "config.json")
+CACHE_PATH = os.path.join(CONF_DIR, "cache.json")
+
+
+class SlackError(Exception):
+    pass
+
+
+class Slack:
+    def __init__(self, token, cookie_d, base=None):
+        self.token = token
+        self.cookie_d = cookie_d
+        self.base = (base or "https://slack.com").rstrip("/")
+        self.cache = {"users": {}, "convs": {}}
+        self.limiter = RateLimiter(rate=10, burst=15)
+        try:
+            with open(CACHE_PATH) as f:
+                self.cache.update(json.load(f))
+        except OSError:
+            pass
+
+    def save_cache(self):
+        os.makedirs(CONF_DIR, exist_ok=True)
+        with open(CACHE_PATH, "w") as f:
+            json.dump(self.cache, f)
+
+    def call(self, method, **params):
+        # Every request funnels through here: rate-limited, and Slack's
+        # 429 Retry-After is honored with a hard cap on retries so a
+        # throttled call can never turn into a retry storm.
+        data = urllib.parse.urlencode(params).encode()
+        for attempt in range(3):
+            self.limiter.acquire()
+            req = urllib.request.Request(f"https://slack.com/api/{method}", data=data)
+            req.add_header("Authorization", f"Bearer {self.token}")
+            req.add_header("Cookie", f"d={self.cookie_d}")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    resp = json.load(r)
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < 2:
+                    retry_after = e.headers.get("Retry-After", "1")
+                    try:
+                        delay = min(float(retry_after), 30.0)
+                    except ValueError:
+                        delay = 1.0
+                    time.sleep(delay)
+                    continue
+                raise
+            if not resp.get("ok"):
+                raise SlackError(f"{method}: {resp.get('error')}")
+            return resp
+        raise SlackError(f"{method}: rate limited")
+
+    # ---- lookups (cached) ----
+
+    def user_name(self, uid):
+        users = self.cache["users"]
+        if uid not in users:
+            try:
+                u = self.call("users.info", user=uid)["user"]
+                users[uid] = (
+                    u.get("profile", {}).get("display_name")
+                    or u.get("real_name")
+                    or u.get("name", uid)
+                )
+            except (SlackError, OSError):
+                users[uid] = uid
+        return users[uid]
+
+    def cached_user(self, uid):
+        return self.cache["users"].get(uid, uid)
+
+    def cached_conv(self, cid):
+        return self.cache["convs"].get(cid, cid)
+
+    def prefetch(self, resolver, ids):
+        """Resolve ids concurrently (only cache misses) — never on the draw path."""
+        seen, todo = set(), []
+        for i in ids:
+            if i and i not in seen:
+                seen.add(i)
+                todo.append(i)
+        if not todo:
+            return
+        # Cap how many ids one action can resolve so a huge thread/channel
+        # can't fan out into hundreds of lookups; the rest resolve lazily
+        # on later views. Concurrency stays low and the shared limiter
+        # bounds the actual request rate.
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            list(ex.map(resolver, todo[:80]))
+        self.save_cache()
+
+    def conv_name(self, cid):
+        convs = self.cache["convs"]
+        if cid not in convs:
+            try:
+                c = self.call("conversations.info", channel=cid)["channel"]
+                if c.get("is_im"):
+                    convs[cid] = "@" + self.user_name(c.get("user", cid))
+                elif c.get("is_mpim"):
+                    name = c.get("purpose", {}).get("value") or c.get("name", cid)
+                    convs[cid] = "@" + re.sub(r"^mpdm-|-\d+$", "", name)[:24]
+                else:
+                    convs[cid] = "#" + c.get("name", cid)
+            except (SlackError, OSError):
+                convs[cid] = cid
+        return convs[cid]
+
+    # ---- data ----
+
+    def counts(self):
+        """Unread/mention counts for all conversations, sorted by importance."""
+        r = self.call("client.counts")
+        convs = []
+        for section, is_im in (("channels", False), ("mpims", False), ("ims", True)):
+            for c in r.get(section, []):
+                mentions = c.get("mention_count", 0) or (c.get("dm_count", 0) if is_im else 0)
+                unread = bool(c.get("has_unreads")) or mentions > 0
+                convs.append({
+                    "id": c["id"],
+                    "mentions": mentions,
+                    "unread": unread,
+                    "latest": float(c.get("latest") or 0),
+                })
+        convs.sort(key=lambda c: (-c["mentions"], -c["unread"], -c["latest"]))
+        return convs
+
+    def history(self, cid, limit=50):
+        msgs = self.call("conversations.history", channel=cid, limit=limit)["messages"]
+        return list(reversed(msgs))
+
+    def replies(self, cid, ts, limit=100):
+        return self.call("conversations.replies", channel=cid, ts=ts, limit=limit)["messages"]
+
+    def post(self, cid, text, thread_ts=None):
+        params = {"channel": cid, "text": text}
+        if thread_ts:
+            params["thread_ts"] = thread_ts
+        return self.call("chat.postMessage", **params)
+
+    def mark(self, cid, ts):
+        self.call("conversations.mark", channel=cid, ts=ts)
+
+    def search(self, query, count=30):
+        r = self.call("search.messages", query=query, count=count,
+                      sort="timestamp", sort_dir="desc")
+        return list(reversed(r.get("messages", {}).get("matches", [])))
+
+    def search_channels(self, query, count=20):
+        """Directory search across ALL public channels, including ones you
+        haven't joined (Slack's internal search.modules.channels; needs
+        multipart form-data on the team's enterprise host). Read-only use:
+        results are only ever opened for viewing, never joined."""
+        boundary = "----herdrSlackBoundary7a1b2c3d"
+        fields = {"token": self.token, "module_list": "channels",
+                  "query": query, "count": str(count)}
+        parts = []
+        for k, v in fields.items():
+            parts += [f"--{boundary}",
+                      f'Content-Disposition: form-data; name="{k}"', "", v]
+        parts += [f"--{boundary}--", ""]
+        body = "\r\n".join(parts).encode()
+        self.limiter.acquire()
+        req = urllib.request.Request(f"{self.base}/api/search.modules.channels", data=body)
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("Cookie", f"d={self.cookie_d}")
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.load(r)
+        if not resp.get("ok"):
+            raise SlackError(f"search.modules.channels: {resp.get('error')}")
+        out = []
+        for it in resp.get("items", []):
+            if it.get("is_private") or it.get("is_archived"):
+                continue
+            self.cache["convs"][it["id"]] = "#" + it.get("name", it["id"])
+            out.append({"id": it["id"], "mentions": 0, "unread": False,
+                        "is_member": bool(it.get("is_member")),
+                        "num_members": it.get("num_members")})
+        return out
+
+    def render_text(self, text):
+        text = re.sub(r"<@(\w+)>", lambda m: "@" + self.cached_user(m.group(1)), text or "")
+        text = re.sub(r"<#\w+\|([^>]*)>", r"#\1", text)
+        text = re.sub(r"<(https?://[^>|]*)\|([^>]*)>", r"\2 (\1)", text)
+        text = re.sub(r"<(https?://[^>]*)>", r"\1", text)
+        text = re.sub(r"<!(\w+)[^>]*>", r"@\1", text)
+        return html.unescape(text)
+
+
+def fmt_ts(ts):
+    import datetime
+    try:
+        return datetime.datetime.fromtimestamp(float(ts)).strftime("%m/%d %H:%M")
+    except (ValueError, OSError):
+        return "?"
+
+
+class UI:
+    def __init__(self, scr, api):
+        self.scr = scr
+        self.api = api
+        self.convs = []
+        self.filter = ""                 # channel-list search string
+        self.msgs = []                   # current channel history
+        self.search_msgs = []            # server search results
+        self.search_active = False
+        self.search_label = ""
+        self.thread_msgs = None          # None = thread pane hidden
+        self.thread_cid = None
+        self.thread_root = None
+        self.focus = "list"              # list | msgs | thread
+        self.sel_conv = 0
+        self.sel_msg = 0
+        self.sel_thread = 0
+        self.top_conv = 0
+        self.top_msg = 0
+        self.top_thread = 0
+        self.cur_cid = None
+        self.status = "loading…  "
+
+    # ---- helpers ----
+
+    def put(self, y, x, s, attr=0):
+        try:
+            self.scr.addstr(y, x, s, attr)
+        except curses.error:
+            pass
+
+    def visible_convs(self):
+        if not self.filter:
+            return self.convs
+        f = self.filter.lower()
+        return [c for c in self.convs if f in self.api.cached_conv(c["id"]).lower()]
+
+    def center_msgs(self):
+        return self.search_msgs if self.search_active else self.msgs
+
+    # ---- drawing ----
+
+    def build_rows(self, msgs, width, show_replies=True, show_chan=False):
+        rows = []
+        for mi, m in enumerate(msgs):
+            who = m.get("user") or m.get("username") or m.get("bot_id", "?")
+            head = f"{fmt_ts(m.get('ts', 0))} {self.api.cached_user(who)}"
+            if show_chan and m.get("channel"):
+                head = "#" + m["channel"].get("name", "") + "  " + head
+            if show_replies and m.get("reply_count"):
+                head += f"  [{m['reply_count']} replies]"
+            rows.append((mi, head, None))
+            for para in (self.api.render_text(m.get("text", "")).splitlines() or [""]):
+                for wl in (textwrap.wrap(para, max(10, width - 2)) or [""]):
+                    rows.append((mi, None, wl))
+        return rows
+
+    def draw_pane(self, x, width, body_h, rows, sel, top, active, title):
+        self.put(0, x, title[:width], curses.color_pair(2) | curses.A_BOLD)
+        vis = body_h - 1
+        max_top = max(0, len(rows) - vis)
+        top = max(0, min(top, max_top))
+        sel_rows = [ri for ri, (mi, _, _) in enumerate(rows) if mi == sel]
+        if sel_rows:
+            if sel_rows[0] < top:
+                top = sel_rows[0]
+            elif sel_rows[-1] >= top + vis:
+                top = min(max_top, sel_rows[-1] - vis + 1)
+        for i, (mi, head, body) in enumerate(rows[top:top + vis]):
+            y = 1 + i
+            selected = (mi == sel) and active
+            if head is not None:
+                attr = curses.color_pair(3) | curses.A_BOLD
+                if selected:
+                    attr |= curses.A_REVERSE
+                self.put(y, x, head[:width], attr)
+            else:
+                self.put(y, x, ("  " + body)[:width], curses.A_REVERSE if selected else 0)
+        return top
+
+    def draw(self):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        lw = max(20, min(30, w // 5))
+        body_h = h - 1
+
+        for y in range(body_h):
+            self.put(y, lw - 1, "│", curses.A_DIM)
+
+        # left: conversation list (with optional filter)
+        vconvs = self.visible_convs()
+        if vconvs:
+            self.sel_conv = max(0, min(self.sel_conv, len(vconvs) - 1))
+        visible = body_h - 1
+        if self.sel_conv < self.top_conv:
+            self.top_conv = self.sel_conv
+        if self.sel_conv >= self.top_conv + visible:
+            self.top_conv = self.sel_conv - visible + 1
+        hdr = ("/" + self.filter) if self.filter else "channels"
+        self.put(0, 0, hdr[:lw - 2].ljust(lw - 2), curses.color_pair(2) | curses.A_BOLD)
+        for i, c in enumerate(vconvs[self.top_conv:self.top_conv + visible]):
+            idx = self.top_conv + i
+            name = self.api.cached_conv(c["id"])
+            is_dir = c.get("is_member") is False and c.get("dir_hint", True) and c in self.dir_results
+            if is_dir:
+                badge = " ·ro"
+            else:
+                badge = f" ({c['mentions']})" if c["mentions"] else (" •" if c["unread"] else "")
+            line = (name + badge)[:lw - 2]
+            attr = curses.A_NORMAL
+            if is_dir:
+                attr |= curses.A_DIM
+            elif c["mentions"]:
+                attr |= curses.color_pair(1) | curses.A_BOLD
+            elif c["unread"]:
+                attr |= curses.A_BOLD
+            else:
+                attr |= curses.A_DIM
+            if idx == self.sel_conv:
+                attr |= curses.A_REVERSE if self.focus == "list" else curses.A_UNDERLINE
+            self.put(1 + i, 0, line.ljust(lw - 2), attr)
+
+        # center (+ optional thread pane on the right)
+        rest_x = lw + 1
+        rest_w = w - rest_x
+        if self.thread_msgs is not None:
+            cw = max(20, int(rest_w * 0.55))
+            tw = rest_w - cw - 1
+            for y in range(body_h):
+                self.put(y, rest_x + cw, "│", curses.A_DIM)
+        else:
+            cw, tw = rest_w, 0
+
+        cmsgs = self.center_msgs()
+        if cmsgs:
+            self.sel_msg = max(0, min(self.sel_msg, len(cmsgs) - 1))
+        if self.search_active:
+            ctitle = f"search: {self.search_label}"
+        elif self.cur_cid:
+            ctitle = self.api.cached_conv(self.cur_cid)
+        else:
+            ctitle = "(pick a channel — enter)"
+        rows = self.build_rows(cmsgs, cw, show_replies=not self.search_active,
+                               show_chan=self.search_active)
+        self.top_msg = self.draw_pane(rest_x, cw, body_h, rows, self.sel_msg,
+                                      self.top_msg, self.focus == "msgs", ctitle)
+
+        if self.thread_msgs is not None:
+            if self.thread_msgs:
+                self.sel_thread = max(0, min(self.sel_thread, len(self.thread_msgs) - 1))
+            trows = self.build_rows(self.thread_msgs, tw, show_replies=False)
+            self.top_thread = self.draw_pane(rest_x + cw + 1, tw, body_h, trows,
+                                             self.sel_thread, self.top_thread,
+                                             self.focus == "thread", "› thread")
+
+        hint = " tab:pane enter:open r:reply /:ch-find s:msg-find m:read u:refresh b:back q:quit "
+        self.put(h - 1, 0, (self.status + hint)[:w - 1].ljust(w - 1), curses.A_REVERSE)
+        scr.refresh()
+
+    # ---- line editor ----
+
+    def read_line(self, prompt, on_change=None):
+        h, w = self.scr.getmaxyx()
+        buf = ""
+        curses.curs_set(1)
+        try:
+            while True:
+                if on_change is not None:
+                    on_change(buf)
+                self.put(h - 1, 0, (prompt + buf).ljust(w - 1)[:w - 1], curses.A_BOLD)
+                self.scr.move(h - 1, min(w - 2, len(prompt + buf)))
+                self.scr.refresh()
+                ch = self.scr.get_wch()
+                if ch in ("\n", "\r"):
+                    return buf
+                if ch == "\x1b":
+                    return None
+                if ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
+                    buf = buf[:-1]
+                elif isinstance(ch, str) and ch.isprintable():
+                    buf += ch
+        finally:
+            curses.curs_set(0)
+
+    # ---- actions ----
+
+    def load_counts(self):
+        self.status = "loading conversations…  "
+        self.draw()
+        try:
+            self.convs = self.api.counts()
+            self.api.prefetch(self.api.conv_name, [c["id"] for c in self.convs[:40]])
+            self.status = f"{sum(1 for c in self.convs if c['unread'])} unread  "
+        except (SlackError, OSError) as e:
+            self.status = str(e) + "  "
+
+    def open_channel(self, cid):
+        self.status = "loading messages…  "
+        self.draw()
+        try:
+            self.msgs = self.api.history(cid)
+            self.api.prefetch(self.api.user_name, [m.get("user") for m in self.msgs])
+            self.cur_cid = cid
+            self.search_active = False
+            self.thread_msgs = None
+            self.sel_msg = max(0, len(self.msgs) - 1)
+            self.top_msg = 10 ** 9
+            self.focus = "msgs"
+            self.status = "  "
+        except (SlackError, OSError) as e:
+            self.status = str(e) + "  "
+
+    def open_thread(self, cid, ts):
+        self.status = "loading thread…  "
+        self.draw()
+        try:
+            msgs = self.api.replies(cid, ts)
+            self.api.prefetch(self.api.user_name, [m.get("user") for m in msgs])
+            self.thread_msgs = msgs
+            self.thread_cid = cid
+            self.thread_root = ts
+            self.sel_thread = max(0, len(msgs) - 1)
+            self.top_thread = 10 ** 9
+            self.focus = "thread"
+            self.status = "  "
+        except (SlackError, OSError) as e:
+            self.status = str(e) + "  "
+
+    def do_channel_search(self):
+        def apply(b):
+            self.filter = b
+            self.sel_conv = 0
+            self.top_conv = 0
+            self.draw()
+        if self.read_line("/", on_change=apply) is None:
+            self.filter = ""
+        self.sel_conv = 0
+
+    def do_message_search(self):
+        if not self.cur_cid:
+            self.status = "open a channel first  "
+            return
+        q = self.read_line("search> ")
+        if not q or not q.strip():
+            return
+        name = self.api.cached_conv(self.cur_cid).lstrip("#@")
+        self.status = "searching…  "
+        self.draw()
+        try:
+            self.search_msgs = self.api.search(f"in:#{name} {q}")
+            self.api.prefetch(self.api.user_name, [m.get("user") for m in self.search_msgs])
+            self.search_active = True
+            self.search_label = q
+            self.sel_msg = max(0, len(self.search_msgs) - 1)
+            self.top_msg = 10 ** 9
+            self.focus = "msgs"
+            self.status = f"{len(self.search_msgs)} results  "
+        except (SlackError, OSError) as e:
+            self.status = str(e) + "  "
+
+    def compose(self, cid, thread_ts=None):
+        text = self.read_line("reply> " if thread_ts else "msg> ")
+        if not text or not text.strip():
+            self.status = "cancelled  "
+            return
+        try:
+            self.api.post(cid, text, thread_ts=thread_ts)
+            self.status = "sent ✓  "
+            if thread_ts and self.thread_msgs is not None:
+                self.thread_msgs = self.api.replies(cid, thread_ts)
+                self.sel_thread = max(0, len(self.thread_msgs) - 1)
+            elif not thread_ts and cid == self.cur_cid and not self.search_active:
+                self.msgs = self.api.history(cid)
+                self.sel_msg = max(0, len(self.msgs) - 1)
+        except (SlackError, OSError) as e:
+            self.status = f"send failed: {e}  "
+
+    # ---- navigation ----
+
+    def cycle_focus(self):
+        order = ["list", "msgs"]
+        if self.thread_msgs is not None:
+            order.append("thread")
+        i = order.index(self.focus) if self.focus in order else 0
+        self.focus = order[(i + 1) % len(order)]
+
+    def move(self, delta):
+        if self.focus == "list":
+            n = len(self.visible_convs())
+            if n:
+                self.sel_conv = max(0, min(n - 1, self.sel_conv + delta))
+        elif self.focus == "msgs":
+            n = len(self.center_msgs())
+            if n:
+                self.sel_msg = max(0, min(n - 1, self.sel_msg + delta))
+        elif self.focus == "thread" and self.thread_msgs:
+            self.sel_thread = max(0, min(len(self.thread_msgs) - 1, self.sel_thread + delta))
+
+    def enter(self):
+        if self.focus == "list":
+            vconvs = self.visible_convs()
+            if vconvs:
+                self.open_channel(vconvs[self.sel_conv]["id"])
+        elif self.focus == "msgs":
+            cmsgs = self.center_msgs()
+            if not cmsgs:
+                return
+            m = cmsgs[self.sel_msg]
+            if self.search_active:
+                cid = (m.get("channel") or {}).get("id", self.cur_cid)
+                ts = m.get("ts")
+            else:
+                cid, ts = self.cur_cid, (m.get("thread_ts") or m.get("ts"))
+            if cid and ts:
+                self.open_thread(cid, ts)
+
+    def reply(self):
+        if self.focus == "thread" and self.thread_msgs is not None:
+            self.compose(self.thread_cid, thread_ts=self.thread_root)
+            return
+        cmsgs = self.center_msgs()
+        if self.focus == "msgs" and cmsgs:
+            m = cmsgs[self.sel_msg]
+            if self.search_active:
+                cid = (m.get("channel") or {}).get("id", self.cur_cid)
+                self.compose(cid, thread_ts=m.get("thread_ts"))
+            elif m.get("reply_count") or m.get("thread_ts"):
+                self.open_thread(self.cur_cid, m.get("thread_ts") or m.get("ts"))
+                self.compose(self.thread_cid, thread_ts=self.thread_root)
+            else:
+                self.compose(self.cur_cid)
+        elif self.cur_cid:
+            self.compose(self.cur_cid)
+
+    def back(self):
+        if self.thread_msgs is not None:
+            self.thread_msgs = None
+            self.focus = "msgs"
+        elif self.search_active:
+            self.search_active = False
+            self.sel_msg = max(0, len(self.msgs) - 1)
+            self.focus = "msgs"
+        else:
+            self.focus = "list"
+
+    def run(self):
+        curses.curs_set(0)
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_RED, -1)
+        curses.init_pair(2, curses.COLOR_CYAN, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        self.load_counts()
+        while True:
+            self.draw()
+            try:
+                key = self.scr.get_wch()
+            except curses.error:
+                continue
+            if key == "q":
+                break
+            elif key == "\t":
+                self.cycle_focus()
+            elif key in ("j", curses.KEY_DOWN):
+                self.move(1)
+            elif key in ("k", curses.KEY_UP):
+                self.move(-1)
+            elif key in ("\n", "\r", curses.KEY_ENTER):
+                self.enter()
+                curses.flushinp()
+            elif key == "r":
+                self.reply()
+                curses.flushinp()
+            elif key == "/":
+                self.do_channel_search()
+            elif key == "s":
+                self.do_message_search()
+                curses.flushinp()
+            elif key == "m" and self.cur_cid and self.msgs:
+                try:
+                    self.api.mark(self.cur_cid, self.msgs[-1]["ts"])
+                    self.status = "marked read  "
+                except (SlackError, OSError) as e:
+                    self.status = str(e) + "  "
+                curses.flushinp()
+            elif key == "u":
+                if self.thread_msgs is not None:
+                    self.open_thread(self.thread_cid, self.thread_root)
+                if self.cur_cid and not self.search_active:
+                    self.open_channel(self.cur_cid)
+                self.load_counts()
+                curses.flushinp()
+            elif key in ("b", "\x1b"):
+                self.back()
+
+
+def load_config():
+    try:
+        with open(CONF_PATH) as f:
+            return json.load(f)
+    except OSError:
+        return None
+
+
+def setup():
+    print("Slack session credentials (stored in", CONF_PATH, "with 0600)")
+    print("1) open https://app.slack.com in your browser, devtools console:")
+    print("   JSON.parse(localStorage.localConfig_v2).teams  -> token (xoxc-…)")
+    print("2) devtools > Application > Cookies > 'd' cookie   -> value (xoxd-…)")
+    token = input("xoxc token: ").strip()
+    cookie = input("xoxd cookie (value of 'd'): ").strip()
+    if not token.startswith("xoxc-") or not cookie.startswith("xoxd-"):
+        sys.exit("expected token starting with xoxc- and cookie starting with xoxd-")
+    os.makedirs(CONF_DIR, exist_ok=True)
+    fd = os.open(CONF_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"token": token, "cookie_d": cookie}, f)
+    print("saved. run: herdr-slack --check")
+
+
+def set_cookie():
+    import getpass
+    conf = load_config()
+    if not conf:
+        sys.exit(f"no config at {CONF_PATH} — run: herdr-slack --setup")
+    cookie = getpass.getpass("xoxd cookie (value of 'd', hidden): ").strip()
+    if not cookie.startswith("xoxd-"):
+        sys.exit("expected cookie starting with xoxd-")
+    conf["cookie_d"] = cookie
+    fd = os.open(CONF_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(conf, f, indent=2)
+    print("cookie saved. run: herdr-slack --check")
+
+
+def main():
+    if "--setup" in sys.argv:
+        setup()
+        return
+    if "--set-cookie" in sys.argv:
+        set_cookie()
+        return
+    conf = load_config()
+    if not conf:
+        sys.exit(f"no config at {CONF_PATH} — run: herdr-slack --setup")
+    if not conf.get("cookie_d"):
+        sys.exit("no cookie stored — run: herdr-slack --set-cookie")
+    api = Slack(conf["token"], conf["cookie_d"])
+    if "--check" in sys.argv:
+        r = api.call("auth.test")
+        print(f"ok: {r.get('user')} @ {r.get('team')} ({r.get('url')})")
+        return
+    curses.wrapper(lambda scr: UI(scr, api).run())
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

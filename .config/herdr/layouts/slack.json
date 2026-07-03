@@ -1,0 +1,37 @@
+{
+  "type": "split",
+  "direction": "right",
+  "ratio": 0.22,
+  "first": {
+    "type": "pane",
+    "label": "channels",
+    "command": [
+      "claude",
+      "--dangerously-skip-permissions",
+      "あなたはSlackのサイドバー役。未読メンション・自分宛DM・参加スレッド新着があるチャンネルを、Slack検索で調べて「#チャンネル名 (件数) — 一言」の形式でコンパクトに一覧表示して。詳細や本文は出さない。以後「更新」と言われたら再取得して同じ形式で表示。"
+    ]
+  },
+  "second": {
+    "type": "split",
+    "direction": "right",
+    "ratio": 0.6,
+    "first": {
+      "type": "pane",
+      "label": "messages",
+      "command": [
+        "claude",
+        "--dangerously-skip-permissions",
+        "あなたはSlackのメイン画面役。未読メンション・自分宛メッセージ・参加スレッドの新着を確認して、重要度順に番号付きで要約して。各項目に返信要否と返信案を添えて。「N番に返信して」と言われたらそのスレッドに返信を送信する。それ以外では送信しないこと。"
+      ]
+    },
+    "second": {
+      "type": "pane",
+      "label": "thread",
+      "command": [
+        "claude",
+        "--dangerously-skip-permissions",
+        "あなたはSlackのスレッド表示ペイン役。SlackのメッセージURLや「#チャンネルの〜の話」を貼られたら、そのスレッド全文を時系列で読みやすく表示し、文脈を踏まえた返信案を提示して。送信は明示的に指示されたときだけ。今は「スレッドURLを貼ってください」とだけ表示して待機。"
+      ]
+    }
+  }
+}

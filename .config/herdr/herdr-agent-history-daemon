@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Record agent completion history from herdr agent-status events.
+
+Subscribes to pane.agent_status_changed on the herdr socket and appends a
+record to ~/.config/herdr/agent-history.jsonl whenever an agent transitions
+from working to done/idle.
+
+herdr accepts only one events.subscribe per connection, so when a new agent
+pane appears (pane.agent_detected) the daemon opens a fresh connection with
+the updated subscription list before closing the old one, then reconciles
+any in-flight "working" panes against their live status so transitions that
+slipped through the switchover are still recorded.
+
+Run under launchd (see dev.herdr.agent-history.plist) or manually.
+"""
+
+import fcntl
+import json
+import os
+import socket
+import sys
+import time
+
+SOCK = os.path.expanduser("~/.config/herdr/herdr.sock")
+HISTORY = os.path.expanduser("~/.config/herdr/agent-history.jsonl")
+LOCK = HISTORY + ".lock"
+MAX_LINES = 2000
+MIN_DURATION_S = 3
+
+
+def call(method, params):
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(10)
+    s.connect(SOCK)
+    s.sendall((json.dumps({"id": f"hist:{method}", "method": method, "params": params}) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    resp = json.loads(buf)
+    if "error" in resp:
+        raise RuntimeError(f"{method}: {resp['error']}")
+    return resp["result"]
+
+
+def trim_history():
+    try:
+        with open(HISTORY) as f:
+            lines = f.readlines()
+        if len(lines) > MAX_LINES:
+            with open(HISTORY, "w") as f:
+                f.writelines(lines[-MAX_LINES:])
+    except OSError:
+        pass
+
+
+def pane_snapshot(pane_id):
+    try:
+        return call("pane.get", {"pane_id": pane_id})["pane"]
+    except Exception:
+        return {}
+
+
+def record_completion(working, pane_id, status, agent=None):
+    info = working.pop(pane_id, None)
+    if not info:
+        return
+    duration = round(time.time() - info["since"], 1)
+    if duration < MIN_DURATION_S:
+        return
+    with open(HISTORY, "a") as f:
+        f.write(json.dumps({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "epoch": round(time.time(), 1),
+            "pane_id": pane_id,
+            "workspace_id": info.get("workspace_id"),
+            "agent": info.get("agent") or agent,
+            "status": status,
+            "duration_s": duration,
+            "label": info.get("label"),
+            "cwd": info.get("cwd"),
+        }, ensure_ascii=False) + "\n")
+
+
+def reconcile(working):
+    """Close out working panes whose completion event was missed."""
+    for pid in list(working):
+        snap = pane_snapshot(pid)
+        status = snap.get("agent_status")
+        if not snap:
+            working.pop(pid, None)  # pane gone
+        elif status in ("done", "idle"):
+            record_completion(working, pid, status)
+
+
+def open_subscription(pane_ids):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(SOCK)
+    subs = [{"type": "pane.agent_detected"}, {"type": "pane.closed"}]
+    subs += [{"type": "pane.agent_status_changed", "pane_id": p} for p in sorted(pane_ids)]
+    s.sendall((json.dumps({
+        "id": "hist:sub",
+        "method": "events.subscribe",
+        "params": {"subscriptions": subs},
+    }) + "\n").encode())
+    return s
+
+
+def run(working):
+    live = {a["pane_id"] for a in call("agent.list", {})["agents"]}
+    for pid in list(working):
+        if pid not in live and not pane_snapshot(pid):
+            working.pop(pid)
+    agent_panes = live | set(working)
+    s = open_subscription(agent_panes)
+    reconcile(working)
+
+    buf = b""
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            raise ConnectionError("event stream closed")
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "event" not in msg:
+                if "error" in msg:
+                    raise RuntimeError(f"server error: {msg['error']}")
+                continue  # subscribe ack
+            data = msg.get("data") or {}
+            event = msg["event"]
+
+            if event in ("pane_agent_detected", "pane.agent_detected"):
+                pane = data.get("pane") or data
+                pid = pane.get("pane_id") or data.get("pane_id")
+                if pid and pid not in agent_panes:
+                    agent_panes.add(pid)
+                    new_s = open_subscription(agent_panes)  # make before break
+                    s.close()
+                    s = new_s
+                    buf = b""
+                    reconcile(working)
+
+            elif event in ("pane_closed", "pane.closed"):
+                pid = data.get("pane_id")
+                working.pop(pid, None)
+                agent_panes.discard(pid)
+
+            elif event == "pane.agent_status_changed":
+                pid = data.get("pane_id")
+                status = data.get("agent_status")
+                if not pid or not status:
+                    continue
+                if status == "working":
+                    if pid not in working:
+                        snap = pane_snapshot(pid)
+                        working[pid] = {
+                            "since": time.time(),
+                            "agent": data.get("agent") or snap.get("agent"),
+                            "label": snap.get("label"),
+                            "cwd": snap.get("foreground_cwd") or snap.get("cwd"),
+                            "workspace_id": data.get("workspace_id"),
+                        }
+                elif status in ("done", "idle"):
+                    record_completion(working, pid, status, data.get("agent"))
+                # "blocked" keeps the working timer running
+
+
+def main():
+    os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
+    lock = open(LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("another herdr-agent-history-daemon is running")
+    trim_history()
+    working = {}
+    while True:
+        try:
+            run(working)
+        except Exception as err:
+            print(f"herdr-agent-history-daemon: {err!r}, retrying", file=sys.stderr, flush=True)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()

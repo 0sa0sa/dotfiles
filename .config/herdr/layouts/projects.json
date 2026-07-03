@@ -1,0 +1,55 @@
+{
+  "type": "split",
+  "direction": "down",
+  "ratio": 0.5,
+  "first": {
+    "type": "split",
+    "direction": "right",
+    "ratio": 0.333,
+    "first": {
+      "type": "pane",
+      "label": "proj-1",
+      "cwd": "~/projects"
+    },
+    "second": {
+      "type": "split",
+      "direction": "right",
+      "ratio": 0.5,
+      "first": {
+        "type": "pane",
+        "label": "proj-2",
+        "cwd": "~/projects"
+      },
+      "second": {
+        "type": "pane",
+        "label": "proj-3",
+        "cwd": "~/projects"
+      }
+    }
+  },
+  "second": {
+    "type": "split",
+    "direction": "right",
+    "ratio": 0.333,
+    "first": {
+      "type": "pane",
+      "label": "proj-4",
+      "cwd": "~/projects"
+    },
+    "second": {
+      "type": "split",
+      "direction": "right",
+      "ratio": 0.5,
+      "first": {
+        "type": "pane",
+        "label": "proj-5",
+        "cwd": "~/projects"
+      },
+      "second": {
+        "type": "pane",
+        "label": "proj-6",
+        "cwd": "~/projects"
+      }
+    }
+  }
+}

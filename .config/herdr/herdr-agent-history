@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Show agent completion history recorded by herdr-agent-history-daemon.
+
+Newest first. With fzf, Enter jumps to the pane (if it still exists).
+Usage: herdr-agent-history [max_entries]
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+SOCK = os.environ.get("HERDR_SOCKET_PATH") or os.path.expanduser("~/.config/herdr/herdr.sock")
+HISTORY = os.path.expanduser("~/.config/herdr/agent-history.jsonl")
+
+
+def call(method, params):
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(10)
+    s.connect(SOCK)
+    s.sendall((json.dumps({"id": f"histview:{method}", "method": method, "params": params}) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    resp = json.loads(buf)
+    if "error" in resp:
+        raise RuntimeError(f"{method}: {resp['error']}")
+    return resp["result"]
+
+
+def fmt_duration(sec):
+    sec = int(sec)
+    if sec >= 3600:
+        return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+    if sec >= 60:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec}s"
+
+
+def fmt_line(r):
+    t = time.strftime("%m-%d %H:%M", time.localtime(r.get("epoch", 0)))
+    mark = "✓" if r.get("status") == "done" else "·"
+    cwd = (r.get("cwd") or "").replace(os.path.expanduser("~"), "~")
+    label = r.get("label") or "-"
+    return (f"{t}  {mark} {r.get('status', '?'):4}  {fmt_duration(r.get('duration_s', 0)):>7}  "
+            f"{r.get('agent', '?'):6}  {label:20.20}  {cwd}  [{r.get('pane_id', '?')}]")
+
+
+def jump(pane_id):
+    """Focus the target pane. Called before the viewer exits; herdr's
+    overlay-close restore is tab-local and does not steal the active
+    workspace, so a synchronous jump survives it."""
+    log = open(os.path.expanduser("~/.config/herdr/agent-history-jump.log"), "a")
+    def note(msg):
+        log.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        log.flush()
+    note(f"jump start pane={pane_id}")
+    try:
+        call("workspace.focus", {"workspace_id": pane_id.split(":")[0]})
+        call("agent.focus", {"target": pane_id})
+        note("jump ok")
+    except Exception as err:
+        note(f"jump failed: {err!r}")
+        subprocess.run(
+            ["herdr", "notification", "show", "jump failed",
+             "--body", f"{pane_id}: {err}", "--sound", "none"],
+            capture_output=True,
+        )
+
+
+def main():
+    if len(sys.argv) > 2 and sys.argv[1] == "--jump":
+        jump(sys.argv[2])
+        return
+    limit = int(sys.argv[1]) if len(sys.argv) > 1 else 200
+    try:
+        with open(HISTORY) as f:
+            records = [json.loads(x) for x in f if x.strip()]
+    except OSError:
+        sys.exit("no history yet (~/.config/herdr/agent-history.jsonl)")
+    if not records:
+        sys.exit("no history yet")
+
+    records = records[-limit:][::-1]
+    lines = [fmt_line(r) for r in records]
+
+    if not sys.stdout.isatty() or subprocess.run(["which", "fzf"], capture_output=True).returncode != 0:
+        print("\n".join(lines))
+        return
+
+    proc = subprocess.run(
+        ["fzf", "--no-sort", "--prompt", "agent history> ",
+         "--header", "Enter: jump to pane / Esc: close"],
+        input="\n".join(lines), capture_output=True, text=True,
+    )
+    choice = proc.stdout.strip()
+    if not choice:
+        return
+    pane_id = choice.rsplit("[", 1)[-1].rstrip("]")
+    jump(pane_id)
+
+
+if __name__ == "__main__":
+    main()

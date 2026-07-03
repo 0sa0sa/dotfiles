@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Create a new herdr workspace from a named pane layout.
+
+Usage:
+  herdr-layout            # pick a layout with fzf (or numbered menu)
+  herdr-layout <name>     # apply ~/.config/herdr/layouts/<name>.json
+
+Layout files are LayoutNode JSON trees (see `layout.apply` in the herdr
+socket API): pane nodes take optional label/command/cwd/env, split nodes
+take direction/ratio/first/second.
+"""
+
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+
+LAYOUT_DIR = os.path.expanduser("~/.config/herdr/layouts")
+SOCK = os.path.expanduser("~/.config/herdr/herdr.sock")
+
+
+def call(method, params):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(SOCK)
+    s.sendall((json.dumps({"id": f"layout-cli:{method}", "method": method, "params": params}) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    resp = json.loads(buf)
+    if "error" in resp:
+        sys.exit(f"herdr API error: {resp['error']}")
+    return resp["result"]
+
+
+def expand_cwds(node):
+    """Expand ~ and $VARS in every pane cwd so layout files stay portable."""
+    if isinstance(node, dict):
+        if node.get("cwd"):
+            node["cwd"] = os.path.expandvars(os.path.expanduser(node["cwd"]))
+        for key in ("first", "second"):
+            if key in node:
+                expand_cwds(node[key])
+    return node
+
+
+def pick(names):
+    if shutil.which("fzf"):
+        proc = subprocess.run(
+            ["fzf", "--prompt", "layout> ", "--height", "100%",
+             "--preview", f"cat {LAYOUT_DIR}/{{}}.json"],
+            input="\n".join(names), capture_output=True, text=True,
+        )
+        choice = proc.stdout.strip()
+        if not choice:
+            sys.exit(0)
+        return choice
+    for i, n in enumerate(names, 1):
+        print(f"{i}) {n}")
+    sel = input("layout number: ").strip()
+    if not sel.isdigit() or not 1 <= int(sel) <= len(names):
+        sys.exit(0)
+    return names[int(sel) - 1]
+
+
+def main():
+    names = sorted(
+        f[:-5] for f in os.listdir(LAYOUT_DIR) if f.endswith(".json")
+    ) if os.path.isdir(LAYOUT_DIR) else []
+    if not names:
+        sys.exit(f"no layouts found in {LAYOUT_DIR}")
+
+    name = sys.argv[1] if len(sys.argv) > 1 else pick(names)
+    if name not in names:
+        sys.exit(f"unknown layout '{name}' (available: {', '.join(names)})")
+
+    with open(os.path.join(LAYOUT_DIR, name + ".json")) as f:
+        root = expand_cwds(json.load(f))
+
+    ws = call("workspace.create", {
+        "cwd": os.getcwd(), "focus": True, "label": name, "env": {},
+    })
+    call("layout.apply", {
+        "root": root, "tab_id": ws["workspace"]["active_tab_id"], "focus": True,
+    })
+
+
+if __name__ == "__main__":
+    main()

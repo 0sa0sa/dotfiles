@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Fork the agent session (Claude Code or Codex) of the current herdr pane
+into a new pane in the chosen direction, in dangerous/yolo mode.
+
+Usage:
+  herdr-fork-agent                      # interactive: press h/j/k/l for direction
+  herdr-fork-agent [pane_id] [h|j|k|l]  # or left|down|up|right
+
+Pane defaults to $HERDR_ACTIVE_PANE_ID (set by herdr [[keys.command]] bindings).
+The session id comes from ~/.config/herdr/agent-sessions/<pane_id>, written by
+the herdr-pane-session.sh SessionStart hook. Fallback: the newest session file
+on disk (per-cwd for claude, global for codex).
+
+The herdr API only splits right/down, so left/up are implemented as a
+right/down split followed by pane.swap.
+"""
+
+import glob
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+
+SOCK = os.environ.get("HERDR_SOCKET_PATH") or os.path.expanduser("~/.config/herdr/herdr.sock")
+
+FORK_COMMANDS = {
+    "claude": "claude --resume {sid} --fork-session --dangerously-skip-permissions",
+    "codex": "codex fork {sid} --dangerously-bypass-approvals-and-sandbox",
+}
+
+# key -> (split direction, swap new pane into the first slot)
+DIRECTIONS = {
+    "h": ("right", True), "left": ("right", True),
+    "j": ("down", False), "down": ("down", False),
+    "k": ("down", True), "up": ("down", True),
+    "l": ("right", False), "right": ("right", False),
+}
+
+
+def call(method, params):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(SOCK)
+    s.sendall((json.dumps({"id": f"fork-agent:{method}", "method": method, "params": params}) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    resp = json.loads(buf)
+    if "error" in resp:
+        fail(f"{method}: {resp['error']}")
+    return resp["result"]
+
+
+def fail(msg):
+    subprocess.run(
+        ["herdr", "notification", "show", "fork failed", "--body", msg, "--sound", "none"],
+        capture_output=True,
+    )
+    sys.exit(msg)
+
+
+def recorded_session_id(pane_id):
+    path = os.path.join(
+        os.path.expanduser("~/.config/herdr/agent-sessions"),
+        pane_id.replace(":", "_").replace("/", "_"),
+    )
+    try:
+        with open(path) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def newest_claude_session_id(cwd):
+    munged = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    files = glob.glob(os.path.join(os.path.expanduser("~/.claude/projects"), munged, "*.jsonl"))
+    if not files:
+        return None
+    return os.path.splitext(os.path.basename(max(files, key=os.path.getmtime)))[0]
+
+
+def newest_codex_session_id():
+    files = glob.glob(os.path.expanduser("~/.codex/sessions/*/*/*/rollout-*.jsonl"))
+    if not files:
+        return None
+    name = os.path.basename(max(files, key=os.path.getmtime))
+    m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", name)
+    return m.group(1) if m else None
+
+
+def forked_label(pane, workspace_id):
+    base = pane.get("label") or pane.get("agent") or "pane"
+    base = re.sub(r"-forked\d+$", "", base)
+    taken = set()
+    for p in call("pane.list", {"workspace_id": workspace_id})["panes"]:
+        m = re.fullmatch(re.escape(base) + r"-forked(\d+)", p.get("label") or "")
+        if m:
+            taken.add(int(m.group(1)))
+    n = 1
+    while n in taken:
+        n += 1
+    return f"{base}-forked{n}"
+
+
+def read_direction_key():
+    import termios
+    import tty
+
+    sys.stdout.write("fork pane:  h ←   j ↓   k ↑   l →   (other key: cancel) ")
+    sys.stdout.flush()
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    print()
+    return ch
+
+
+def main():
+    pane_id = None
+    direction_key = None
+    for a in sys.argv[1:]:
+        if a in DIRECTIONS:
+            direction_key = a
+        else:
+            pane_id = a
+
+    pane_id = pane_id or os.environ.get("HERDR_ACTIVE_PANE_ID")
+    if not pane_id:
+        fail("no pane id (HERDR_ACTIVE_PANE_ID unset)")
+
+    if direction_key is None:
+        if sys.stdin.isatty():
+            direction_key = read_direction_key()
+            if direction_key not in DIRECTIONS:
+                sys.exit(0)
+        else:
+            direction_key = "l"
+    direction, swap = DIRECTIONS[direction_key]
+
+    pane = call("pane.get", {"pane_id": pane_id})["pane"]
+    agent = pane.get("agent")
+    if agent not in FORK_COMMANDS:
+        fail(f"pane {pane_id} is not running a forkable agent (agent={agent})")
+    cwd = pane.get("foreground_cwd") or pane.get("cwd") or os.path.expanduser("~")
+
+    session_id = recorded_session_id(pane_id)
+    if not session_id:
+        session_id = (
+            newest_claude_session_id(cwd) if agent == "claude" else newest_codex_session_id()
+        )
+    if not session_id:
+        fail(f"no {agent} session found for pane {pane_id}")
+
+    new_pane = call("pane.split", {
+        "target_pane_id": pane_id,
+        "direction": direction,
+        "cwd": cwd,
+        "focus": True,
+    })["pane"]
+    if swap:
+        call("pane.swap", {
+            "source_pane_id": new_pane["pane_id"],
+            "target_pane_id": pane_id,
+        })
+    call("pane.rename", {
+        "pane_id": new_pane["pane_id"],
+        "label": forked_label(pane, pane["workspace_id"]),
+    })
+    subprocess.run(
+        ["herdr", "pane", "run", new_pane["pane_id"],
+         FORK_COMMANDS[agent].format(sid=session_id)],
+        capture_output=True, check=True,
+    )
+
+
+if __name__ == "__main__":
+    main()

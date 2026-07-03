@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Open a URL or local HTML file in a Carbonyl browser pane.
+
+Usage:
+  herdr-html <url-or-file> [right|down] [--ratio FLOAT]
+
+Run from inside a herdr pane: a new pane splits off the current one and
+renders the page with Carbonyl (Chromium-based terminal browser).
+"""
+
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+
+SOCK = os.environ.get("HERDR_SOCKET_PATH") or os.path.expanduser("~/.config/herdr/herdr.sock")
+
+
+def call(method, params):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(SOCK)
+    s.sendall((json.dumps({"id": f"html:{method}", "method": method, "params": params}) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    resp = json.loads(buf)
+    if "error" in resp:
+        sys.exit(f"herdr API error: {resp['error']}")
+    return resp["result"]
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        sys.exit(__doc__.strip())
+    ratio = None
+    if "--ratio" in args:
+        i = args.index("--ratio")
+        ratio = float(args[i + 1])
+        del args[i:i + 2]
+    direction = next((a for a in args if a in ("right", "down")), "right")
+    target = next((a for a in args if a not in ("right", "down")), None)
+    if not target:
+        sys.exit("no url or file given")
+
+    if "://" not in target:
+        path = os.path.abspath(target)
+        if not os.path.exists(path):
+            sys.exit(f"file not found: {target}")
+        target = "file://" + path
+
+    pane_id = os.environ.get("HERDR_PANE_ID") or os.environ.get("HERDR_ACTIVE_PANE_ID")
+    if not pane_id:
+        sys.exit("not inside a herdr pane (HERDR_PANE_ID unset)")
+
+    params = {"target_pane_id": pane_id, "direction": direction, "focus": True}
+    if ratio:
+        params["ratio"] = ratio
+    new_pane = call("pane.split", params)["pane"]
+    subprocess.run(
+        ["herdr", "pane", "run", new_pane["pane_id"], f"carbonyl {shlex.quote(target)}"],
+        capture_output=True, check=True,
+    )
+
+
+if __name__ == "__main__":
+    main()

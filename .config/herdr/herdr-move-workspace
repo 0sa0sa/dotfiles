@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Reorder the focused herdr workspace earlier/later in the sidebar.
+
+Usage:
+  herdr-move-workspace prev   # move focused workspace one slot earlier (up)
+  herdr-move-workspace next   # move focused workspace one slot later (down)
+  herdr-move-workspace <workspace_id> <insert_index>   # explicit
+
+Needs the `workspace.move` socket API (herdr protocol >= 15, currently the
+preview channel). On stable it fails gracefully with a notification.
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+
+SOCK = os.environ.get("HERDR_SOCKET_PATH") or os.path.expanduser("~/.config/herdr/herdr.sock")
+
+
+def call(method, params):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(SOCK)
+    s.sendall((json.dumps({"id": f"move-ws:{method}", "method": method, "params": params}) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    return json.loads(buf)
+
+
+def notify(title, body):
+    subprocess.run(
+        ["herdr", "notification", "show", title, "--body", body, "--sound", "none"],
+        capture_output=True,
+    )
+
+
+def result_or_fail(resp):
+    if "error" in resp:
+        msg = resp["error"].get("message", "")
+        if "unknown variant `workspace.move`" in msg:
+            notify(
+                "並べ替え未対応",
+                "workspace.move はこのherdrに無し。preview に更新が必要 "
+                "(herdr channel set preview && herdr update --handoff)",
+            )
+            sys.exit("workspace.move unsupported on this herdr build")
+        notify("並べ替え失敗", msg)
+        sys.exit(msg)
+    return resp["result"]
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        sys.exit(__doc__.strip())
+
+    workspaces = call("workspace.list", {})["result"]["workspaces"]
+    order = [w["workspace_id"] for w in workspaces]
+
+    if args[0] in ("prev", "next"):
+        focused = next((w["workspace_id"] for w in workspaces if w["focused"]), None)
+        if not focused:
+            sys.exit("no focused workspace")
+        cur = order.index(focused)
+        target = cur - 1 if args[0] == "prev" else cur + 1
+        if target < 0 or target >= len(order):
+            return  # already at the edge; nothing to do
+        ws_id, insert_index = focused, target
+    else:
+        ws_id = args[0]
+        insert_index = int(args[1])
+
+    result_or_fail(call("workspace.move", {"workspace_id": ws_id, "insert_index": insert_index}))
+
+
+if __name__ == "__main__":
+    main()

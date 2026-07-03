@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Handoff the current Codex pane to a new Claude pane.
+
+Usage:
+  herdr-handoff-claude
+
+Designed for a Herdr key binding. It reads the focused Codex pane, captures a
+compact recent transcript plus git metadata, then opens a sibling Claude pane
+preloaded with that handoff text.
+"""
+
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SOCK = os.environ.get("HERDR_SOCKET_PATH") or os.path.expanduser("~/.config/herdr/herdr.sock")
+
+
+def call(method, params):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(SOCK)
+    s.sendall((json.dumps({"id": f"handoff:{method}", "method": method, "params": params}) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    resp = json.loads(buf)
+    if "error" in resp:
+        fail(f"{method}: {resp['error']}")
+    return resp["result"]
+
+
+def fail(msg):
+    subprocess.run(
+        ["herdr", "notification", "show", "handoff failed", "--body", msg, "--sound", "none"],
+        capture_output=True,
+    )
+    sys.exit(msg)
+
+
+def current_pane_id():
+    return os.environ.get("HERDR_ACTIVE_PANE_ID")
+
+
+def run_text(cmd, cwd=None):
+    proc = subprocess.run(
+        cmd,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.rstrip("\n")
+
+
+def git_meta(cwd):
+    if not cwd:
+        return []
+    inside = run_text(["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"])
+    if inside != "true":
+        return []
+    branch = run_text(["git", "-C", cwd, "branch", "--show-current"]) or "(detached)"
+    status = run_text(["git", "-C", cwd, "status", "--short"]) or ""
+    lines = [f"- git branch: {branch}"]
+    if status.strip():
+        lines.append("- git status:")
+        for line in status.splitlines():
+            lines.append(f"  {line}")
+    else:
+        lines.append("- git status: clean")
+    return lines
+
+
+def build_prompt(pane, recent):
+    agent_session = pane.get("agent_session") or {}
+    session_id = agent_session.get("value") or "-"
+    cwd = pane.get("foreground_cwd") or pane.get("cwd") or os.path.expanduser("~")
+    lines = [
+        "You are taking over from a Codex session in Herdr.",
+        "This is a handoff, not a fresh task. Continue from the latest unfinished work.",
+        "",
+        f"- source pane: {pane.get('pane_id')}",
+        f"- source agent session: {session_id}",
+        f"- cwd: {cwd}",
+    ]
+    lines.extend(git_meta(cwd))
+    lines.extend([
+        "",
+        "Recent Codex context:",
+        "```text",
+        recent.strip(),
+        "```",
+        "",
+        "Resume from here. Do not restate completed work unless it is needed to orient the next step.",
+    ])
+    return "\n".join(lines).strip() + "\n"
+
+
+def main():
+    pane_id = current_pane_id()
+    if not pane_id:
+        fail("HERDR_ACTIVE_PANE_ID is unset")
+
+    pane = call("pane.get", {"pane_id": pane_id})["pane"]
+    if pane.get("agent") != "codex":
+        fail(f"pane {pane_id} is not a Codex pane (agent={pane.get('agent')})")
+
+    cwd = pane.get("foreground_cwd") or pane.get("cwd") or os.path.expanduser("~")
+    recent = subprocess.run(
+        ["herdr", "pane", "read", pane_id, "--source", "recent-unwrapped", "--lines", "100"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    prompt = build_prompt(pane, recent)
+
+    with tempfile.NamedTemporaryFile("w", delete=False, prefix="herdr-handoff-", suffix=".prompt") as prompt_file:
+        prompt_file.write(prompt)
+        prompt_path = prompt_file.name
+
+    wrapper = tempfile.NamedTemporaryFile("w", delete=False, prefix="herdr-handoff-", suffix=".sh")
+    wrapper_path = Path(wrapper.name)
+    wrapper.write("#!/usr/bin/env bash\n")
+    wrapper.write("set -euo pipefail\n")
+    wrapper.write(f"prompt_file={shlex.quote(prompt_path)}\n")
+    wrapper.write(f"cwd={shlex.quote(cwd)}\n")
+    wrapper.write('prompt="$(cat \"$prompt_file\")"\n')
+    wrapper.write('rm -f -- "$prompt_file" "$0"\n')
+    wrapper.write('cd "$cwd"\n')
+    wrapper.write('exec claude --dangerously-skip-permissions "$prompt"\n')
+    wrapper.close()
+    os.chmod(wrapper_path, 0o755)
+
+    new_pane = call("pane.split", {
+        "target_pane_id": pane_id,
+        "direction": "right",
+        "cwd": cwd,
+        "focus": True,
+    })["pane"]
+    call("pane.rename", {
+        "pane_id": new_pane["pane_id"],
+        "label": "claude-handoff",
+    })
+    subprocess.run(
+        ["herdr", "pane", "run", new_pane["pane_id"], f"bash {shlex.quote(str(wrapper_path))}"],
+        check=True,
+    )
+
+
+if __name__ == "__main__":
+    main()

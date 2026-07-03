@@ -1,0 +1,66 @@
+onboarding = false
+[ui.toast]
+delivery = "herdr"
+
+[ui]
+show_agent_labels_on_pane_borders = false
+
+agent_panel_sort = "spaces"
+[theme]
+name = "terminal"
+auto_switch = false
+
+[keys]
+prefix = "ctrl+k"
+next_agent = "prefix+a"
+previous_agent = "prefix+shift+a"
+focus_agent = "prefix+alt+1..9"
+focus_pane_left = ["prefix+h", "alt+h"]
+focus_pane_down = ["prefix+j", "alt+j"]
+focus_pane_up = ["prefix+k", "alt+k"]
+focus_pane_right = ["prefix+l", "alt+l"]
+last_pane = "prefix+o"
+open_notification_target = "prefix+shift+o"
+
+[[keys.command]]
+key = "prefix+shift+l"
+type = "pane"
+command = "~/.config/herdr/herdr-layout"
+
+[[keys.command]]
+key = "prefix+f"
+type = "pane"
+command = "~/.config/herdr/herdr-fork-agent"
+
+[[keys.command]]
+key = "prefix+shift+c"
+type = "pane"
+command = "~/.config/herdr/herdr-handoff-codex"
+
+[[keys.command]]
+key = "prefix+shift+v"
+type = "pane"
+command = "~/.config/herdr/herdr-handoff-claude"
+
+[[keys.command]]
+key = "prefix+shift+s"
+type = "pane"
+command = "~/.config/herdr/herdr-slack"
+
+[[keys.command]]
+key = "prefix+d"
+type = "pane"
+command = "~/.config/herdr/herdr-agent-history"
+
+[[keys.command]]
+key = "prefix+comma"
+type = "shell"
+command = "~/.config/herdr/herdr-move-workspace prev"
+
+[[keys.command]]
+key = "prefix+period"
+type = "shell"
+command = "~/.config/herdr/herdr-move-workspace next"
+
+[worktrees]
+directory = "~/projects/worktrees"
