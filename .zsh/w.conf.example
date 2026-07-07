@@ -1,0 +1,40 @@
+# w() function configuration — copy to ~/.zsh/w.conf and edit for your projects.
+# This file is sourced by ~/.zsh/functions/w.zsh
+#
+# Assumed layout:
+#   ~/projects/<project>/            main git repo
+#   ~/projects/worktrees/<project>/  worktrees created by w()
+
+# =============================================================================
+# Project Aliases (short name -> full project directory name under ~/projects)
+# =============================================================================
+typeset -gA W_ALIASES
+W_ALIASES=(
+    a   my-app
+    b   another-project
+)
+
+# =============================================================================
+# Files to copy after creating a worktree (only on creation, never overwrites)
+# Format: "source:destination" (paths relative to project root), space-separated
+# =============================================================================
+typeset -gA W_COPY_FILES
+W_COPY_FILES=(
+    # my-app ".env.example:.env"
+)
+
+# =============================================================================
+# Commands to run once, after creating a NEW worktree
+# =============================================================================
+typeset -gA W_SETUP_COMMANDS
+W_SETUP_COMMANDS=(
+    # my-app "pnpm install"
+)
+
+# =============================================================================
+# Commands to run every time you enter a worktree (use sparingly)
+# =============================================================================
+typeset -gA W_ENTER_COMMANDS
+W_ENTER_COMMANDS=(
+    # my-app "echo 'entered my-app worktree'"
+)
