@@ -157,7 +157,7 @@ def build_wrapper(task_dir, agent, model, safe, cwd):
     import tempfile
 
     prompt_path = os.path.join(task_dir, "prompt.md")
-    model_part = MODEL_FLAGS[agent].format(m=model) if model else ""
+    model_part = MODEL_FLAGS[agent].format(m=shlex.quote(model)) if model else ""
     danger_part = "" if safe else DANGER_FLAGS[agent]
     agent_cmd = AGENT_CMDS[agent].format(model=model_part, danger=danger_part, cwd='"$cwd"')
     wrapper = tempfile.NamedTemporaryFile(
@@ -204,8 +204,14 @@ def cmd_spawn(args):
         pane_id = pane["pane_id"]
 
     wrapper = build_wrapper(task_dir, args.agent, args.model, args.safe, cwd)
-    subprocess.run(["herdr", "pane", "run", pane_id, f"bash {wrapper}"],
-                   capture_output=True, check=True)
+    proc = subprocess.run(["herdr", "pane", "run", pane_id, f"bash {wrapper}"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        try:
+            os.unlink(wrapper)
+        except OSError:
+            pass
+        raise RuntimeError(f"herdr pane run failed: {proc.stderr.strip()}")
     call("pane.rename", {"pane_id": pane_id, "label": task_id})
 
     manifest = {
