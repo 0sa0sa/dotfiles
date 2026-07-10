@@ -187,21 +187,35 @@ def cmd_spawn(args):
 
     worktree_path = worktree_branch = None
     if args.worktree is not None:
-        raise SystemExit("--worktree は Task 5 で実装")  # Task 5 で置換
-
-    ws = current_workspace_id()
-    tab = hcli("tab", "create", "--workspace", ws, "--cwd", cwd,
-               "--label", task_id, "--no-focus")
-    # probe 実測 (2026-07-10, herdr 0.7.1): tab create の応答に
-    # root_pane が直接含まれる（pane_id/tab_id 込み）。pane.list による
-    # tab_id 一致検索は不要だが、将来のスキーマ変化に備え fallback を残す。
-    tab_id = tab["tab"]["tab_id"] if "tab" in tab else tab["tab_id"]
-    if "root_pane" in tab:
-        pane_id = tab["root_pane"]["pane_id"]
+        worktree_branch = args.worktree or f"delegate/{task_id}"
+        wt = hcli("worktree", "create", "--cwd", cwd,
+                  "--branch", worktree_branch, "--json", "--no-focus")
+        # probe 実測 (2026-07-10, herdr 0.7.1): brief の想定キー
+        # (wt["path"] / wt["workspace_id"]) は存在しない。実際の応答は
+        # {"root_pane": {pane_id, tab_id, workspace_id, ...},
+        #  "tab": {...}, "workspace": {...},
+        #  "worktree": {branch, path, open_workspace_id, ...}} 形。
+        # root_pane に pane_id/tab_id/workspace_id が同梱されている点は
+        # tab create の root_pane fallback と同型なので pane.list は不要。
+        worktree_path = wt["worktree"]["path"]
+        ws = wt["root_pane"]["workspace_id"]
+        pane_id = wt["root_pane"]["pane_id"]
+        tab_id = wt["root_pane"]["tab_id"]
+        cwd = worktree_path
     else:
-        panes = call("pane.list", {"workspace_id": ws})["panes"]
-        pane = next(p for p in panes if p["tab_id"] == tab_id)
-        pane_id = pane["pane_id"]
+        ws = current_workspace_id()
+        tab = hcli("tab", "create", "--workspace", ws, "--cwd", cwd,
+                   "--label", task_id, "--no-focus")
+        # probe 実測 (2026-07-10, herdr 0.7.1): tab create の応答に
+        # root_pane が直接含まれる（pane_id/tab_id 込み）。pane.list による
+        # tab_id 一致検索は不要だが、将来のスキーマ変化に備え fallback を残す。
+        tab_id = tab["tab"]["tab_id"] if "tab" in tab else tab["tab_id"]
+        if "root_pane" in tab:
+            pane_id = tab["root_pane"]["pane_id"]
+        else:
+            panes = call("pane.list", {"workspace_id": ws})["panes"]
+            pane = next(p for p in panes if p["tab_id"] == tab_id)
+            pane_id = pane["pane_id"]
 
     wrapper = build_wrapper(task_dir, args.agent, args.model, args.safe, cwd)
     proc = subprocess.run(["herdr", "pane", "run", pane_id, f"bash {wrapper}"],
@@ -442,10 +456,20 @@ def cmd_kill(args):
     task_dir = task_dir_of(args.task_id)
     m = load_manifest(task_dir)
     pane = get_pane(m["pane_id"])
-    if pane:
-        hcli("pane", "close", m["pane_id"])
     if args.rm_worktree and m.get("worktree_path"):
-        pass  # Task 5 で実装
+        # 実測 (2026-07-10, smoke test): herdr worktree remove は対象
+        # workspace 全体 (pane 込み) を畳む。brief の想定順 (先に pane close
+        # → worktree remove) だと、worktree の workspace は pane が1つしか
+        # ないため pane close の時点で workspace ごと消え、後続の
+        # worktree remove が workspace_not_found で失敗する。そのため
+        # worktree モードでは pane close を呼ばず worktree remove のみで
+        # 完結させる (pane が既に無ければ workspace も既に無いとみなし
+        # skip = idempotent kill、非 worktree モードの pane close 経路は
+        # 変更なし)。
+        if pane:
+            hcli("worktree", "remove", "--workspace", m["workspace_id"], "--force")
+    elif pane:
+        hcli("pane", "close", m["pane_id"])
     m["killed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     save_manifest(task_dir, m)
 
