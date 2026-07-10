@@ -93,5 +93,97 @@ class TestManifest(unittest.TestCase):
             self.assertEqual(hd.load_manifest(d)["pane_id"], "w1:p1")
 
 
+class TestBuildWrapper(unittest.TestCase):
+    def test_model_shell_injection_protection(self):
+        """Guard against shell injection via --model parameter.
+
+        This test verifies that a malicious model string containing shell
+        metacharacters is properly quoted so it cannot execute as shell commands.
+        """
+        import shlex
+
+        # Malicious model string with shell metacharacters
+        malicious_model = "haiku'; touch /tmp/should-not-exist-via-test; echo '"
+
+        with tempfile.TemporaryDirectory() as task_dir:
+            with tempfile.TemporaryDirectory() as cwd_dir:
+                # Create required prompt.md file
+                with open(os.path.join(task_dir, "prompt.md"), "w") as f:
+                    f.write("test prompt\n")
+
+                wrapper_path = hd.build_wrapper(
+                    task_dir, "claude", malicious_model, False, cwd_dir
+                )
+                self.addCleanup(lambda: os.path.exists(wrapper_path) and os.unlink(wrapper_path))
+
+                # Read the generated wrapper script
+                with open(wrapper_path) as f:
+                    wrapper_content = f.read()
+
+                # Verify the model value was quoted using shlex.quote() before insertion
+                # This ensures the malicious string appears as a single literal token
+                expected_model_part = "--model " + shlex.quote(malicious_model)
+                self.assertIn(
+                    expected_model_part,
+                    wrapper_content,
+                    "Model parameter must be properly quoted to prevent shell injection"
+                )
+
+                # Find the exec line and verify shell parsing would not execute injection
+                exec_line = None
+                for line in wrapper_content.split('\n'):
+                    if 'exec claude' in line:
+                        exec_line = line
+                        break
+
+                self.assertIsNotNone(exec_line, "No 'exec claude' line found in wrapper")
+
+                # Parse with shlex to verify malicious components are not separate tokens
+                try:
+                    tokens = shlex.split(exec_line)
+                    # If injection were possible, 'touch' and the path would be separate tokens
+                    self.assertNotIn('touch', tokens,
+                                   "Shell injection detected: 'touch' is a separate token")
+                    self.assertNotIn('/tmp/should-not-exist-via-test', tokens,
+                                   "Shell injection detected: path is a separate token")
+                except ValueError:
+                    # Parsing might fail if script contains unexpanded shell variables like $prompt
+                    # In that case, just verify the expected quoting is present
+                    pass
+
+        # Belt-and-suspenders: verify the file was never created by injection
+        self.assertFalse(
+            os.path.exists('/tmp/should-not-exist-via-test'),
+            "Malicious file should not have been created"
+        )
+        # Cleanup in case it somehow was created
+        self.addCleanup(
+            lambda: os.path.exists('/tmp/should-not-exist-via-test') and os.unlink('/tmp/should-not-exist-via-test')
+        )
+
+    def test_normal_model_parameter_works(self):
+        """Verify that normal model names still work correctly after the fix."""
+        with tempfile.TemporaryDirectory() as task_dir:
+            with tempfile.TemporaryDirectory() as cwd_dir:
+                # Create required prompt.md file
+                with open(os.path.join(task_dir, "prompt.md"), "w") as f:
+                    f.write("test prompt\n")
+
+                wrapper_path = hd.build_wrapper(
+                    task_dir, "claude", "sonnet", False, cwd_dir
+                )
+                self.addCleanup(lambda: os.path.exists(wrapper_path) and os.unlink(wrapper_path))
+
+                # Read the generated wrapper script
+                with open(wrapper_path) as f:
+                    wrapper_content = f.read()
+
+                # Verify the normal model name is present and properly quoted
+                self.assertIn('--model sonnet', wrapper_content,
+                            "Normal model parameter should be in wrapper")
+                self.assertIn('exec claude', wrapper_content,
+                            "exec claude command should be in wrapper")
+
+
 if __name__ == "__main__":
     unittest.main()
