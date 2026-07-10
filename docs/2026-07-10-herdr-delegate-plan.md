@@ -946,7 +946,7 @@ Expected: symlink 経由で SKILL.md が読める（スキルは次回セッシ�
 
 ```bash
 cd ~/dotfiles && grep -rinE '会社名やメール・鍵のパターン' .config/herdr/herdr-delegate .claude/skills/herdr-delegate/ docs/2026-07-10-herdr-delegate-*.md
-# 実際は: grep -rinE 'legalon|dealon|@[a-z0-9.-]+\.(jp|com)|AKIA|ghp_|xox[bap]|api[_-]?key'
+# 実際は: grep -rinE '<company>|<product>|@[a-z0-9.-]+\.(jp|com)|AKIA|ghp_|xox[bap]|api[_-]?key'
 git add .claude/skills/herdr-delegate .config/herdr/herdr-delegate docs/
 git commit -m "feat(herdr-delegate): user-level skill and symlink deployment"
 ```

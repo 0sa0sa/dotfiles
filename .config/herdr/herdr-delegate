@@ -141,7 +141,8 @@ def current_workspace_id():
 # ---------- spawn ----------
 
 AGENT_CMDS = {
-    # {model} は "--model X" / "-m X" 済み文字列、{cwd} と {prompt} は wrapper 内で展開
+    # {model}/{danger} はここで埋め込み済みの文字列。cwd/prompt はテンプレート外で
+    # wrapper スクリプトの $cwd / $prompt シェル変数として展開される
     "claude": 'exec claude {model} {danger} "$prompt"',
     "codex": 'exec codex {model} {danger} --cd "$cwd" "$prompt"',
 }
@@ -159,7 +160,7 @@ def build_wrapper(task_dir, agent, model, safe, cwd):
     prompt_path = os.path.join(task_dir, "prompt.md")
     model_part = MODEL_FLAGS[agent].format(m=shlex.quote(model)) if model else ""
     danger_part = "" if safe else DANGER_FLAGS[agent]
-    agent_cmd = AGENT_CMDS[agent].format(model=model_part, danger=danger_part, cwd='"$cwd"')
+    agent_cmd = AGENT_CMDS[agent].format(model=model_part, danger=danger_part)
     wrapper = tempfile.NamedTemporaryFile(
         "w", delete=False, prefix="herdr-delegate-", suffix=".sh"
     )
@@ -255,12 +256,12 @@ NUDGE_TEXT = "委任契約を確認: 完了しているなら {result} に statu
 # いたが、本タスクの実測では herdr はこのダイアログ表示中も agent_status
 # を "idle" として報告した (working/blocked にはならない)。そのため検出
 # チェックは agent_status の値に関係なく毎ループ試みる (下記 cmd_wait 参照)。
-# "do you trust the files in this folder" 系の文言は claude のバージョン
-# 差分に備えた保険として残す。
+# "trust the files in this folder" は claude のバージョン差分に備えた保険。
+# "do you trust the contents of this directory" は Task 6 で実測した codex
+# 固有の初回ディレクトリ trust ダイアログの文言 (claude とは別文言)。
 TRUST_PROMPT_MARKERS = (
     "is this a project you created or one you trust",
     "trust this folder",
-    "do you trust the files in this folder",
     "trust the files in this folder",
     "do you trust the contents of this directory",
 )
