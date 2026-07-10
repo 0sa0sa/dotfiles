@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import os
+import shutil
 import tempfile
 import types
 import unittest
@@ -485,6 +486,118 @@ class TestSendLine(unittest.TestCase):
                       if c.args[0][:3] == ["herdr", "agent", "send"]]
         # retries=1 means the initial attempt plus one retry = 2 sends.
         self.assertEqual(len(send_calls), 2)
+
+
+class TestCmdKillWorktreeOrdering(unittest.TestCase):
+    """Regression coverage for cmd_kill's pane-close/worktree-remove ordering.
+
+    Bug (Task 5, live smoke test, 2026-07-10): the original cmd_kill closed
+    a task's pane unconditionally before calling `herdr worktree remove`.
+    For worktree-mode tasks, `worktree remove` tears down the entire
+    single-pane workspace itself -- closing the pane first made the
+    workspace vanish, so the subsequent `worktree remove` failed with
+    workspace_not_found (reproduced live once; required manual
+    `git worktree remove --force` / `git branch -D` cleanup of an
+    orphaned worktree).
+
+    The fix: skip the redundant `pane close` when doing --rm-worktree
+    removal of a worktree-mode task (worktree remove handles pane teardown
+    itself); for non-worktree tasks, or when --rm-worktree is not passed,
+    still just close the pane normally and leave any worktree/branch alone
+    (cleanup of the worktree/branch is explicit/opt-in only).
+
+    All herdr I/O (hcli, get_pane) is mocked; manifest.json is written via
+    the real save_manifest/load_manifest helpers into a tempdir, matching
+    the pattern used elsewhere in this file.
+    """
+
+    @staticmethod
+    def _args(task_id, rm_worktree):
+        return types.SimpleNamespace(task_id=task_id, rm_worktree=rm_worktree)
+
+    def _make_task_dir(self, manifest_extra=None):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        manifest = {
+            "task_id": "dlg-test-kill",
+            "agent": "claude",
+            "pane_id": "w1:p1",
+            "workspace_id": "ws1",
+        }
+        if manifest_extra:
+            manifest.update(manifest_extra)
+        hd.save_manifest(d, manifest)
+        return d
+
+    @staticmethod
+    def _hcli_calls(m_hcli, *prefix):
+        return [c for c in m_hcli.call_args_list if c.args[:len(prefix)] == prefix]
+
+    def test_worktree_rm_with_pane_alive_removes_worktree_not_pane(self):
+        """(rm_worktree=True, worktree_path set, pane exists): this is the
+        core fix. worktree remove IS called; pane close is NOT (no
+        redundant pane-close before worktree removal)."""
+        d = self._make_task_dir({"worktree_path": "/tmp/wt/dlg-test-kill"})
+        with mock.patch.object(hd, "task_dir_of", return_value=d), \
+             mock.patch.object(hd, "get_pane", return_value={"agent_status": "idle"}), \
+             mock.patch.object(hd, "hcli") as m_hcli:
+            hd.cmd_kill(self._args("dlg-test-kill", rm_worktree=True))
+
+        worktree_calls = self._hcli_calls(m_hcli, "worktree", "remove")
+        pane_calls = self._hcli_calls(m_hcli, "pane", "close")
+        self.assertEqual(len(worktree_calls), 1, m_hcli.call_args_list)
+        self.assertEqual(len(pane_calls), 0, m_hcli.call_args_list)
+        self.assertIsNotNone(hd.load_manifest(d).get("killed_at"))
+
+    def test_worktree_rm_with_pane_already_gone_skips_both_calls(self):
+        """(rm_worktree=True, worktree_path set, pane already gone /
+        get_pane() returns None): documents CURRENT behavior. The
+        `if pane:` guard inside the rm_worktree branch short-circuits, so
+        NEITHER `worktree remove` NOR `pane close` is called. This means
+        the worktree/branch is left un-cleaned-up in this edge case --
+        see the task report for a note on whether this is worth a
+        follow-up (this test intentionally does not fix it, only pins
+        current behavior)."""
+        d = self._make_task_dir({"worktree_path": "/tmp/wt/dlg-test-kill"})
+        with mock.patch.object(hd, "task_dir_of", return_value=d), \
+             mock.patch.object(hd, "get_pane", return_value=None), \
+             mock.patch.object(hd, "hcli") as m_hcli:
+            hd.cmd_kill(self._args("dlg-test-kill", rm_worktree=True))
+
+        self.assertEqual(m_hcli.call_count, 0, m_hcli.call_args_list)
+
+    def test_non_worktree_task_closes_pane_no_worktree_call(self):
+        """(rm_worktree=False, no worktree_path, pane exists): plain kill
+        of a non-worktree task. pane close IS called; worktree remove is
+        NOT (there is no worktree to remove)."""
+        d = self._make_task_dir()  # no worktree_path key at all
+        with mock.patch.object(hd, "task_dir_of", return_value=d), \
+             mock.patch.object(hd, "get_pane", return_value={"agent_status": "idle"}), \
+             mock.patch.object(hd, "hcli") as m_hcli:
+            hd.cmd_kill(self._args("dlg-test-kill", rm_worktree=False))
+
+        pane_calls = self._hcli_calls(m_hcli, "pane", "close")
+        worktree_calls = self._hcli_calls(m_hcli, "worktree", "remove")
+        self.assertEqual(len(pane_calls), 1, m_hcli.call_args_list)
+        self.assertEqual(pane_calls[0].args, ("pane", "close", "w1:p1"))
+        self.assertEqual(len(worktree_calls), 0, m_hcli.call_args_list)
+
+    def test_worktree_task_without_rm_flag_closes_pane_leaves_worktree(self):
+        """(rm_worktree=False, worktree_path set, pane exists): plain kill
+        of a worktree-mode task without --rm-worktree. pane close IS
+        called (same as any plain kill), but worktree/branch cleanup is
+        explicit/opt-in -- worktree remove is NOT called even though the
+        task has a worktree_path."""
+        d = self._make_task_dir({"worktree_path": "/tmp/wt/dlg-test-kill"})
+        with mock.patch.object(hd, "task_dir_of", return_value=d), \
+             mock.patch.object(hd, "get_pane", return_value={"agent_status": "idle"}), \
+             mock.patch.object(hd, "hcli") as m_hcli:
+            hd.cmd_kill(self._args("dlg-test-kill", rm_worktree=False))
+
+        pane_calls = self._hcli_calls(m_hcli, "pane", "close")
+        worktree_calls = self._hcli_calls(m_hcli, "worktree", "remove")
+        self.assertEqual(len(pane_calls), 1, m_hcli.call_args_list)
+        self.assertEqual(len(worktree_calls), 0, m_hcli.call_args_list)
 
 
 if __name__ == "__main__":
