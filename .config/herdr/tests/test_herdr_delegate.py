@@ -326,20 +326,48 @@ class TestSendLine(unittest.TestCase):
     The fix widens the verification read to pane_tail(pane_id, lines=40)
     (source=recent-unwrapped), matching the pattern already used
     elsewhere in the file, instead of a bespoke `--lines 5` read.
+
+    Reviewer finding (2026-07-10, post-merge review of 3404f58): the
+    original version of this test's mock returned the SAME full
+    `wide_stdout` no matter what `--lines`/`--source` the code under test
+    actually passed, and separately re-derived a "narrow window" via
+    Python string slicing as an unrelated sanity check. That meant the
+    mock could not distinguish the fixed code from the old buggy code
+    (`["herdr", "agent", "read", pane_id, "--lines", "5"]`, no --source):
+    both would have been handed the full wide_stdout and both would have
+    "passed". The strengthened mock below performs a REAL truncation
+    driven by the REAL `--lines` value in the command it receives, so the
+    test's pass/fail outcome is actually coupled to send_line's behavior.
     """
 
     PANE_ID = "w1:p1"
     TEXT = "ありがとう。他に作業は不要。長めのメッセージでテストする。"
+
+    # Fixture with the echo line near the top, followed by enough
+    # simulated "agent reply" lines to push it out of a naive last-5-lines
+    # view while still being well within a last-40-lines view.
+    REPLY_LINES = [f"agent reply line {i}" for i in range(10)]
+    FIXTURE_LINES = [TEXT] + REPLY_LINES
 
     @staticmethod
     def _completed(cmd, stdout=""):
         import subprocess as _sp
         return _sp.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
 
-    def _fake_run_factory(self, read_stdout_by_call=None, default_read_stdout=""):
+    @classmethod
+    def _tail(cls, n):
+        """The last n lines of FIXTURE_LINES, joined like real pane output."""
+        return "\n".join(cls.FIXTURE_LINES[-n:]) + "\n"
+
+    def _fake_run_factory(self):
         """Builds a subprocess.run side_effect that branches on the herdr
-        subcommand, so `send`/`send-keys` calls always succeed and only the
-        `agent read` calls return the crafted stdout under test."""
+        subcommand, so `send`/`send-keys` calls always succeed. Crucially,
+        `agent read` calls parse the REAL `--lines` value out of the
+        command argv and return only that many trailing lines of
+        FIXTURE_LINES -- a real truncation driven by the real call args,
+        not a pre-computed constant. This makes the mock behave like an
+        actual capped pane read: request `--lines 40` and you get the
+        echo back; request the old narrow `--lines 5` and you don't."""
         calls = {"read": 0}
 
         def fake_run(cmd, **kwargs):
@@ -348,43 +376,63 @@ class TestSendLine(unittest.TestCase):
             if cmd[:3] == ["herdr", "pane", "send-keys"]:
                 return self._completed(cmd)
             if cmd[:3] == ["herdr", "agent", "read"]:
-                idx = calls["read"]
                 calls["read"] += 1
-                if read_stdout_by_call is not None and idx < len(read_stdout_by_call):
-                    return self._completed(cmd, read_stdout_by_call[idx])
-                return self._completed(cmd, default_read_stdout)
+                if "--lines" not in cmd:
+                    raise AssertionError(f"agent read without --lines: {cmd}")
+                n = int(cmd[cmd.index("--lines") + 1])
+                return self._completed(cmd, self._tail(n))
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        return fake_run
+
+    def _constant_fake_run_factory(self, read_stdout):
+        """Simpler mock for tests that don't care about window sizing:
+        every `agent read` call returns the same fixed stdout regardless
+        of args. Used by the plain success/exhausted-retries tests below,
+        which are not about the echo-window regression."""
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["herdr", "agent", "send"]:
+                return self._completed(cmd)
+            if cmd[:3] == ["herdr", "pane", "send-keys"]:
+                return self._completed(cmd)
+            if cmd[:3] == ["herdr", "agent", "read"]:
+                return self._completed(cmd, read_stdout)
             raise AssertionError(f"unexpected command: {cmd}")
 
         return fake_run
 
     def test_fast_reply_pushes_echo_out_of_narrow_window_but_wide_window_catches_it(self):
-        # Simulate what a real capped read would return: the agent replied
-        # fast enough that many lines of its own output now sit after the
-        # echoed input line. A naive last-5-lines check would miss the
-        # echo entirely; the widened pane_tail(lines=40) read must still
-        # contain it.
-        reply_lines = [f"agent reply line {i}" for i in range(10)]
-        wide_stdout = "\n".join([self.TEXT] + reply_lines) + "\n"
+        # Sanity-check the fixture is representative: the last-5-lines
+        # view must NOT contain the echo, while the last-40-lines view
+        # must contain it. (Documents intent; the real proof is below,
+        # where fake_run truncates based on send_line's actual argv.)
+        self.assertNotIn(self.TEXT[:20], self._tail(5))
+        self.assertIn(self.TEXT[:20], self._tail(40))
 
-        # Sanity-check the scenario is actually representative: the OLD
-        # narrow (last-5-lines) view of this same output would NOT contain
-        # the echo, proving the fix (not just the test data) matters.
-        narrow_tail = "\n".join(wide_stdout.splitlines()[-5:])
-        self.assertNotIn(self.TEXT[:20], narrow_tail)
-
-        fake_run = self._fake_run_factory(default_read_stdout=wide_stdout)
+        fake_run = self._fake_run_factory()
         with mock.patch.object(hd.subprocess, "run", side_effect=fake_run) as m_run, \
              mock.patch.object(hd.time, "sleep"):
             result = hd.send_line(self.PANE_ID, self.TEXT)
 
+        # This assertion is the behavioral proof: it only passes if
+        # send_line's real verification read requested enough lines
+        # (--lines 40, via pane_tail) for the mock's real truncation to
+        # still contain the echo. If send_line regresses to the old
+        # narrow `--lines 5` read, the mock truncates to _tail(5), the
+        # echo is absent, and this goes False (see mutation-test note in
+        # the class docstring / task report for a live before/after run
+        # against a temporarily-reverted herdr-delegate).
         self.assertTrue(result)
         send_calls = [c for c in m_run.call_args_list
                       if c.args[0][:3] == ["herdr", "agent", "send"]]
         self.assertEqual(len(send_calls), 1, "must not retry / double-send")
 
-        # The verification read must use the same wide pattern as
-        # pane_tail(): recent-unwrapped source, lines=40 (not the old
-        # narrow "--lines 5" with default source).
+        # Secondary, literal check: the verification read must use the
+        # same wide pattern as pane_tail(): recent-unwrapped source,
+        # lines=40 (not the old narrow "--lines 5" with default source).
+        # Kept for readability/debuggability, but the assertTrue(result)
+        # above (backed by real mock truncation) is the primary proof.
         read_calls = [c for c in m_run.call_args_list
                       if c.args[0][:3] == ["herdr", "agent", "read"]]
         self.assertEqual(len(read_calls), 1)
@@ -394,8 +442,28 @@ class TestSendLine(unittest.TestCase):
         self.assertIn("--lines", read_cmd)
         self.assertEqual(read_cmd[read_cmd.index("--lines") + 1], "40")
 
+    def test_old_narrow_read_would_have_failed_verification(self):
+        """Direct proof that the mock itself is faithful: replaying the
+        OLD buggy read command (`--lines 5`, no --source) against the
+        same fixture/truncation logic used above yields stdout that does
+        NOT contain the echo. This is what send_line would have seen pre-
+        fix, and it is what causes
+        test_fast_reply_pushes_echo_out_of_narrow_window_but_wide_window_catches_it
+        to fail if send_line's real implementation ever regresses back to
+        that narrow read (verified live via mutation testing; see task
+        report)."""
+        fake_run = self._fake_run_factory()
+        old_buggy_read_cmd = ["herdr", "agent", "read", self.PANE_ID, "--lines", "5"]
+        old_result = fake_run(old_buggy_read_cmd)
+        self.assertNotIn(self.TEXT[:20], old_result.stdout)
+
+        new_fixed_read_cmd = ["herdr", "agent", "read", self.PANE_ID,
+                               "--source", "recent-unwrapped", "--lines", "40"]
+        new_result = fake_run(new_fixed_read_cmd)
+        self.assertIn(self.TEXT[:20], new_result.stdout)
+
     def test_send_succeeds_cleanly_on_first_attempt(self):
-        fake_run = self._fake_run_factory(default_read_stdout=f"{self.TEXT}\n")
+        fake_run = self._constant_fake_run_factory(f"{self.TEXT}\n")
         with mock.patch.object(hd.subprocess, "run", side_effect=fake_run) as m_run, \
              mock.patch.object(hd.time, "sleep"):
             result = hd.send_line(self.PANE_ID, self.TEXT)
@@ -407,7 +475,7 @@ class TestSendLine(unittest.TestCase):
 
     def test_send_fails_after_retries_exhausted(self):
         # Echo never shows up in any read, no matter how many attempts.
-        fake_run = self._fake_run_factory(default_read_stdout="unrelated pane output\n")
+        fake_run = self._constant_fake_run_factory("unrelated pane output\n")
         with mock.patch.object(hd.subprocess, "run", side_effect=fake_run) as m_run, \
              mock.patch.object(hd.time, "sleep"):
             result = hd.send_line(self.PANE_ID, self.TEXT, retries=1)
