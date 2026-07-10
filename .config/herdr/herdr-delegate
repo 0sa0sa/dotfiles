@@ -226,6 +226,176 @@ def cmd_spawn(args):
                       "task_dir": task_dir}, ensure_ascii=False))
 
 
+POLL_SECS = 5
+NUDGE_TEXT = "委任契約を確認: 完了しているなら {result} に status/summary/artifacts を書くこと。"
+
+# 一回限りの trust-dialog 検出用: pane の可視テキストにこの部分文字列
+# (小文字比較) が含まれていたら、確認プロンプト待ちとみなし Return を1回送る。
+# 実測 (2026-07-10, claude CLI, herdr 0.7.1, 本 Task 3 のスモークテスト):
+# 実際の文言は以下 (フォルダ初回アクセス時の一回限りのダイアログ):
+#   "Quick safety check: Is this a project you created or one you trust?"
+#   "... take a moment to review what's in this folder first."
+#   "Claude Code'll be able to read, edit, and execute files here."
+#   選択肢: "1. Yes, I trust this folder" / "2. No, exit"
+# 事前情報 (Task 2 での目視) は agent_status が "unknown" になると想定して
+# いたが、本タスクの実測では herdr はこのダイアログ表示中も agent_status
+# を "idle" として報告した (working/blocked にはならない)。そのため検出
+# チェックは agent_status の値に関係なく毎ループ試みる (下記 cmd_wait 参照)。
+# "do you trust the files in this folder" 系の文言は claude のバージョン
+# 差分に備えた保険として残す。
+TRUST_PROMPT_MARKERS = (
+    "is this a project you created or one you trust",
+    "trust this folder",
+    "do you trust the files in this folder",
+    "trust the files in this folder",
+)
+
+
+def is_trust_prompt(text):
+    """pane の可視テキストが trust/confirm ダイアログらしいか判定する純関数."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in TRUST_PROMPT_MARKERS)
+
+
+def task_dir_of(task_id):
+    d = os.path.join(TASKS_DIR, task_id)
+    if not os.path.isdir(d):
+        raise SystemExit(f"unknown task: {task_id}")
+    return d
+
+
+def send_line(pane_id, text, retries=1):
+    for _ in range(retries + 1):
+        subprocess.run(["herdr", "agent", "send", pane_id, text],
+                       capture_output=True, check=True)
+        time.sleep(0.3)
+        subprocess.run(["herdr", "pane", "send-keys", pane_id, "enter"],
+                       capture_output=True, check=True)
+        time.sleep(0.5)
+        proc = subprocess.run(
+            ["herdr", "agent", "read", pane_id, "--lines", "5"],
+            capture_output=True, text=True)
+        if text[:20] in proc.stdout:
+            return True
+    return False
+
+
+def nudge(pane_id, task_dir):
+    return send_line(pane_id, NUDGE_TEXT.format(
+        result=os.path.join(task_dir, "result.md")))
+
+
+def pane_tail(pane_id, lines=40):
+    proc = subprocess.run(
+        ["herdr", "agent", "read", pane_id, "--source", "recent-unwrapped",
+         "--lines", str(lines)],
+        capture_output=True, text=True)
+    return proc.stdout
+
+
+def pane_visible(pane_id, lines=20):
+    proc = subprocess.run(
+        ["herdr", "agent", "read", pane_id, "--source", "visible",
+         "--lines", str(lines)],
+        capture_output=True, text=True)
+    return proc.stdout
+
+
+def cmd_wait(args):
+    task_dir = task_dir_of(args.task_id)
+    manifest = load_manifest(task_dir)
+    pane_id = manifest["pane_id"]
+    deadline = time.time() + args.timeout / 1000 if args.timeout else None
+    nudged = False
+    idle_since = None
+    trust_workaround_tried = False
+
+    while True:
+        pane = get_pane(pane_id)
+        status = pane.get("agent_status") if pane else None
+
+        # 一回限りの trust-dialog ワークアラウンド: claude の「このフォルダ
+        # を信頼しますか」ダイアログが出ている間、decide() の nudge/stall
+        # ロジックは無力 (テキスト送信ではダイアログは進まず、NUDGE →
+        # STALL に陥る)。当初は agent_status が idle/working/blocked 以外
+        # (例: "unknown") になる想定だったが、実測 (本 Task 3 のスモーク
+        # テスト, herdr 0.7.1) ではこのダイアログ表示中も agent_status は
+        # "idle" のままだった。そのため agent_status の値では判別せず、
+        # 毎ループ pane の可視テキストを見て判定する (decide() 自体は変更
+        # せず、ここで一度だけ検出・対処してから通常のフローへ戻す)。
+        if pane is not None and not trust_workaround_tried:
+            visible = pane_visible(pane_id)
+            if is_trust_prompt(visible):
+                subprocess.run(["herdr", "pane", "send-keys", pane_id, "Return"],
+                               capture_output=True)
+                # 一度 Return を送ったらこの task 内では再送しない (何か
+                # 他の原因で unknown が続いていても、無限に Enter を連打
+                # しないための one-shot ガード)。marker が見つからない間は
+                # 毎ループ再チェックしてよい (ダイアログが遅れて出るケー
+                # スを取り逃さないため)。
+                trust_workaround_tried = True
+                time.sleep(POLL_SECS)
+                continue
+
+        if status == "idle":
+            idle_since = idle_since or time.time()
+        else:
+            idle_since = None
+        idle_secs = time.time() - idle_since if idle_since else 0
+        action = decide(status, read_result_status(task_dir), nudged, idle_secs)
+
+        if action == "DONE":
+            print(json.dumps({"task_id": args.task_id, "status": "done",
+                              "result": os.path.join(task_dir, "result.md")}))
+            sys.exit(0)
+        if action == "FAILED_RESULT":
+            print(json.dumps({"task_id": args.task_id, "status": "failed",
+                              "result": os.path.join(task_dir, "result.md")}))
+            sys.exit(1)
+        if action == "BLOCKED":
+            subprocess.run(["herdr", "notification", "show",
+                            f"delegate {args.task_id} blocked",
+                            "--body", "サブエージェントが入力待ち"],
+                           capture_output=True)
+            print(json.dumps({"task_id": args.task_id, "status": "blocked"}))
+            print(pane_tail(pane_id), file=sys.stderr)
+            sys.exit(2)
+        if action == "STALLED":
+            print(json.dumps({"task_id": args.task_id, "status": "stalled"}))
+            print(pane_tail(pane_id), file=sys.stderr)
+            sys.exit(3)
+        if action == "PANE_GONE":
+            print(json.dumps({"task_id": args.task_id, "status": "failed",
+                              "reason": "pane gone"}))
+            sys.exit(4)
+        if action == "NUDGE":
+            nudge(pane_id, task_dir)
+            nudged = True
+            idle_since = None
+
+        if deadline and time.time() > deadline:
+            print(json.dumps({"task_id": args.task_id, "status": "timeout",
+                              "agent_status": status}))
+            print(pane_tail(pane_id), file=sys.stderr)
+            sys.exit(3)
+        time.sleep(POLL_SECS)
+
+
+def cmd_collect(args):
+    task_dir = task_dir_of(args.task_id)
+    result = os.path.join(task_dir, "result.md")
+    if os.path.exists(result):
+        with open(result) as f:
+            print(f.read())
+        return
+    manifest = load_manifest(task_dir)
+    print("# result.md なし — pane 末尾で代替:", file=sys.stderr)
+    print(pane_tail(manifest["pane_id"], 60))
+    sys.exit(3)
+
+
 def main():
     import argparse
 
@@ -244,6 +414,15 @@ def main():
     g.add_argument("--prompt")
     g.add_argument("--prompt-file")
     sp.set_defaults(func=cmd_spawn)
+
+    wp = sub.add_parser("wait")
+    wp.add_argument("task_id")
+    wp.add_argument("--timeout", type=int, help="ms")
+    wp.set_defaults(func=cmd_wait)
+
+    cp = sub.add_parser("collect")
+    cp.add_argument("task_id")
+    cp.set_defaults(func=cmd_collect)
 
     args = p.parse_args()
     args.func(args)

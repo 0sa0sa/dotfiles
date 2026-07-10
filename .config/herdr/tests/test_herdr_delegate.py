@@ -93,6 +93,32 @@ class TestManifest(unittest.TestCase):
             self.assertEqual(hd.load_manifest(d)["pane_id"], "w1:p1")
 
 
+class TestIsTrustPrompt(unittest.TestCase):
+    def test_matches_observed_claude_dialog_text(self):
+        # 実測 (2026-07-10, claude CLI, Task 3 スモークテスト) の実際の文言
+        text = (
+            "Quick safety check: Is this a project you created or one you "
+            "trust?\n\n❯ 1. Yes, I trust this folder\n  2. No, exit"
+        )
+        self.assertTrue(hd.is_trust_prompt(text))
+
+    def test_matches_alternate_wording(self):
+        text = "Do you trust the files in this folder?\n1. Yes  2. No"
+        self.assertTrue(hd.is_trust_prompt(text))
+
+    def test_case_insensitive(self):
+        text = "DO YOU TRUST THE FILES IN THIS FOLDER?"
+        self.assertTrue(hd.is_trust_prompt(text))
+
+    def test_no_match_on_normal_output(self):
+        text = "some normal claude output about the task\nworking...\n"
+        self.assertFalse(hd.is_trust_prompt(text))
+
+    def test_empty_or_none_is_false(self):
+        self.assertFalse(hd.is_trust_prompt(""))
+        self.assertFalse(hd.is_trust_prompt(None))
+
+
 class TestBuildWrapper(unittest.TestCase):
     def test_model_shell_injection_protection(self):
         """Guard against shell injection via --model parameter.
