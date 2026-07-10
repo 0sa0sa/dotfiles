@@ -2,7 +2,9 @@ import importlib.machinery
 import importlib.util
 import os
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "herdr-delegate")
 loader = importlib.machinery.SourceFileLoader("herdr_delegate", SCRIPT)
@@ -209,6 +211,106 @@ class TestBuildWrapper(unittest.TestCase):
                             "Normal model parameter should be in wrapper")
                 self.assertIn('exec claude', wrapper_content,
                             "exec claude command should be in wrapper")
+
+
+class TestWaitTrustWorkaroundOneShot(unittest.TestCase):
+    """Regression coverage for cmd_wait's one-shot trust-dialog workaround.
+
+    is_trust_prompt() itself is a pure function already covered by
+    TestIsTrustPrompt above. What is NOT covered anywhere else is the
+    control-flow property inside cmd_wait: once the trust dialog is
+    detected and a Return keystroke is sent, `trust_workaround_tried`
+    must prevent the block from ever running again for the rest of the
+    task's polling loop (no re-check of pane_visible, no repeated
+    Return), and decide()'s normal idle-tracking bookkeeping must resume
+    untouched on subsequent iterations. All herdr I/O (subprocess calls,
+    time.sleep) is mocked so this exercises only the control flow.
+    """
+
+    TRUST_DIALOG_TEXT = (
+        "Quick safety check: Is this a project you created or one you "
+        "trust?\n\n❯ 1. Yes, I trust this folder\n  2. No, exit"
+    )
+    NORMAL_TEXT = "some normal claude output about the task\nworking...\n"
+
+    @staticmethod
+    def _args(task_id):
+        return types.SimpleNamespace(task_id=task_id, timeout=None)
+
+    @staticmethod
+    def _return_sendkeys_calls(run_mock):
+        return [
+            c for c in run_mock.call_args_list
+            if c.args and isinstance(c.args[0], list)
+            and c.args[0][:3] == ["herdr", "pane", "send-keys"]
+            and c.args[0][-1] == "Return"
+        ]
+
+    def test_trust_dialog_sends_return_exactly_once_across_polls(self):
+        # iter1: dialog visible -> one-shot workaround fires and `continue`s
+        #        (decide()/idle bookkeeping must NOT run this iteration).
+        # iter2-3: workaround already tried -> normal polling resumes,
+        #        agent still "working".
+        # iter4: agent goes idle and result.md says "done" -> DONE exit.
+        pane_sequence = [
+            {"agent_status": "working"},
+            {"agent_status": "working"},
+            {"agent_status": "working"},
+            {"agent_status": "idle"},
+            {"agent_status": "idle"},  # unused safety buffer
+        ]
+        with mock.patch.object(hd, "task_dir_of", return_value="/fake/task/dir"), \
+             mock.patch.object(hd, "load_manifest", return_value={"pane_id": "w1:p1"}), \
+             mock.patch.object(hd, "get_pane", side_effect=pane_sequence), \
+             mock.patch.object(hd, "pane_visible",
+                                return_value=self.TRUST_DIALOG_TEXT) as m_pane_visible, \
+             mock.patch.object(hd, "read_result_status", return_value="done"), \
+             mock.patch.object(hd, "nudge", return_value=True) as m_nudge, \
+             mock.patch.object(hd.time, "sleep"), \
+             mock.patch.object(hd.subprocess, "run") as m_run:
+            with self.assertRaises(SystemExit) as cm:
+                hd.cmd_wait(self._args("dlg-test-trust-oneshot"))
+
+        self.assertEqual(cm.exception.code, 0)
+        # One-shot guard: even though the mocked pane text keeps matching
+        # the trust-dialog markers forever, the `not trust_workaround_tried`
+        # guard must stop the block from re-checking after the first hit.
+        # If a future refactor moves/drops that guard or the `continue`,
+        # pane_visible would be re-invoked every loop and this fails.
+        self.assertEqual(m_pane_visible.call_count, 1)
+        return_calls = self._return_sendkeys_calls(m_run)
+        self.assertEqual(len(return_calls), 1, return_calls)
+        self.assertEqual(
+            return_calls[0].args[0],
+            ["herdr", "pane", "send-keys", "w1:p1", "Return"],
+        )
+        # The trust-dialog iteration must short-circuit before decide()'s
+        # nudge/idle-tracking logic runs, so nudge() is never reached here.
+        m_nudge.assert_not_called()
+
+    def test_no_trust_dialog_never_sends_return(self):
+        pane_sequence = [
+            {"agent_status": "working"},
+            {"agent_status": "working"},
+            {"agent_status": "idle"},
+        ]
+        with mock.patch.object(hd, "task_dir_of", return_value="/fake/task/dir"), \
+             mock.patch.object(hd, "load_manifest", return_value={"pane_id": "w1:p1"}), \
+             mock.patch.object(hd, "get_pane", side_effect=pane_sequence), \
+             mock.patch.object(hd, "pane_visible",
+                                return_value=self.NORMAL_TEXT) as m_pane_visible, \
+             mock.patch.object(hd, "read_result_status", return_value="done"), \
+             mock.patch.object(hd, "nudge", return_value=True) as m_nudge, \
+             mock.patch.object(hd.time, "sleep"), \
+             mock.patch.object(hd.subprocess, "run") as m_run:
+            with self.assertRaises(SystemExit) as cm:
+                hd.cmd_wait(self._args("dlg-test-no-trust-dialog"))
+
+        self.assertEqual(cm.exception.code, 0)
+        self.assertGreaterEqual(m_pane_visible.call_count, 1)
+        return_calls = self._return_sendkeys_calls(m_run)
+        self.assertEqual(len(return_calls), 0, return_calls)
+        m_nudge.assert_not_called()
 
 
 if __name__ == "__main__":
