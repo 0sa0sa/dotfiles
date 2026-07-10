@@ -266,7 +266,22 @@ def task_dir_of(task_id):
     return d
 
 
+def pane_tail(pane_id, lines=40):
+    proc = subprocess.run(
+        ["herdr", "agent", "read", pane_id, "--source", "recent-unwrapped",
+         "--lines", str(lines)],
+        capture_output=True, text=True)
+    return proc.stdout
+
+
 def send_line(pane_id, text, retries=1):
+    # エコーバック検証窓: 狭い窓 (旧: --lines 5, デフォルト source) だと、
+    # haiku 等の速い agent の返信が数行入るだけでエコーが窓外に押し出され
+    # 偽陰性 → retry で同一テキストが二重送信される (実測 2026-07-10)。
+    # pane_tail() と同じ recent-unwrapped / lines=40 を使うことで、数行の
+    # 速い返信が入っても echo が窓内に残る可能性を大幅に上げる (理論上
+    # レースを消せるわけではないが、他の一発ワークアラウンド同様の許容
+    # レベルに合わせる)。
     for _ in range(retries + 1):
         subprocess.run(["herdr", "agent", "send", pane_id, text],
                        capture_output=True, check=True)
@@ -274,10 +289,7 @@ def send_line(pane_id, text, retries=1):
         subprocess.run(["herdr", "pane", "send-keys", pane_id, "enter"],
                        capture_output=True, check=True)
         time.sleep(0.5)
-        proc = subprocess.run(
-            ["herdr", "agent", "read", pane_id, "--lines", "5"],
-            capture_output=True, text=True)
-        if text[:20] in proc.stdout:
+        if text[:20] in pane_tail(pane_id, lines=40):
             return True
     return False
 
@@ -285,14 +297,6 @@ def send_line(pane_id, text, retries=1):
 def nudge(pane_id, task_dir):
     return send_line(pane_id, NUDGE_TEXT.format(
         result=os.path.join(task_dir, "result.md")))
-
-
-def pane_tail(pane_id, lines=40):
-    proc = subprocess.run(
-        ["herdr", "agent", "read", pane_id, "--source", "recent-unwrapped",
-         "--lines", str(lines)],
-        capture_output=True, text=True)
-    return proc.stdout
 
 
 def pane_visible(pane_id, lines=20):

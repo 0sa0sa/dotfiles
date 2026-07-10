@@ -313,5 +313,111 @@ class TestWaitTrustWorkaroundOneShot(unittest.TestCase):
         m_nudge.assert_not_called()
 
 
+class TestSendLine(unittest.TestCase):
+    """Regression coverage for send_line's echo-verification window.
+
+    Bug (Task 4 live smoke test, 2026-07-10): against a fast-replying agent
+    (e.g. haiku), the echoed input text can be pushed out of a narrow
+    5-line tail by the time the agent's reply arrives, before send_line's
+    verification read runs. That false negative triggered a retry, which
+    sent the same text to the pane a second time (confirmed live: the
+    message appeared twice with two separate agent replies).
+
+    The fix widens the verification read to pane_tail(pane_id, lines=40)
+    (source=recent-unwrapped), matching the pattern already used
+    elsewhere in the file, instead of a bespoke `--lines 5` read.
+    """
+
+    PANE_ID = "w1:p1"
+    TEXT = "ありがとう。他に作業は不要。長めのメッセージでテストする。"
+
+    @staticmethod
+    def _completed(cmd, stdout=""):
+        import subprocess as _sp
+        return _sp.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    def _fake_run_factory(self, read_stdout_by_call=None, default_read_stdout=""):
+        """Builds a subprocess.run side_effect that branches on the herdr
+        subcommand, so `send`/`send-keys` calls always succeed and only the
+        `agent read` calls return the crafted stdout under test."""
+        calls = {"read": 0}
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["herdr", "agent", "send"]:
+                return self._completed(cmd)
+            if cmd[:3] == ["herdr", "pane", "send-keys"]:
+                return self._completed(cmd)
+            if cmd[:3] == ["herdr", "agent", "read"]:
+                idx = calls["read"]
+                calls["read"] += 1
+                if read_stdout_by_call is not None and idx < len(read_stdout_by_call):
+                    return self._completed(cmd, read_stdout_by_call[idx])
+                return self._completed(cmd, default_read_stdout)
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        return fake_run
+
+    def test_fast_reply_pushes_echo_out_of_narrow_window_but_wide_window_catches_it(self):
+        # Simulate what a real capped read would return: the agent replied
+        # fast enough that many lines of its own output now sit after the
+        # echoed input line. A naive last-5-lines check would miss the
+        # echo entirely; the widened pane_tail(lines=40) read must still
+        # contain it.
+        reply_lines = [f"agent reply line {i}" for i in range(10)]
+        wide_stdout = "\n".join([self.TEXT] + reply_lines) + "\n"
+
+        # Sanity-check the scenario is actually representative: the OLD
+        # narrow (last-5-lines) view of this same output would NOT contain
+        # the echo, proving the fix (not just the test data) matters.
+        narrow_tail = "\n".join(wide_stdout.splitlines()[-5:])
+        self.assertNotIn(self.TEXT[:20], narrow_tail)
+
+        fake_run = self._fake_run_factory(default_read_stdout=wide_stdout)
+        with mock.patch.object(hd.subprocess, "run", side_effect=fake_run) as m_run, \
+             mock.patch.object(hd.time, "sleep"):
+            result = hd.send_line(self.PANE_ID, self.TEXT)
+
+        self.assertTrue(result)
+        send_calls = [c for c in m_run.call_args_list
+                      if c.args[0][:3] == ["herdr", "agent", "send"]]
+        self.assertEqual(len(send_calls), 1, "must not retry / double-send")
+
+        # The verification read must use the same wide pattern as
+        # pane_tail(): recent-unwrapped source, lines=40 (not the old
+        # narrow "--lines 5" with default source).
+        read_calls = [c for c in m_run.call_args_list
+                      if c.args[0][:3] == ["herdr", "agent", "read"]]
+        self.assertEqual(len(read_calls), 1)
+        read_cmd = read_calls[0].args[0]
+        self.assertIn("--source", read_cmd)
+        self.assertEqual(read_cmd[read_cmd.index("--source") + 1], "recent-unwrapped")
+        self.assertIn("--lines", read_cmd)
+        self.assertEqual(read_cmd[read_cmd.index("--lines") + 1], "40")
+
+    def test_send_succeeds_cleanly_on_first_attempt(self):
+        fake_run = self._fake_run_factory(default_read_stdout=f"{self.TEXT}\n")
+        with mock.patch.object(hd.subprocess, "run", side_effect=fake_run) as m_run, \
+             mock.patch.object(hd.time, "sleep"):
+            result = hd.send_line(self.PANE_ID, self.TEXT)
+
+        self.assertTrue(result)
+        send_calls = [c for c in m_run.call_args_list
+                      if c.args[0][:3] == ["herdr", "agent", "send"]]
+        self.assertEqual(len(send_calls), 1)
+
+    def test_send_fails_after_retries_exhausted(self):
+        # Echo never shows up in any read, no matter how many attempts.
+        fake_run = self._fake_run_factory(default_read_stdout="unrelated pane output\n")
+        with mock.patch.object(hd.subprocess, "run", side_effect=fake_run) as m_run, \
+             mock.patch.object(hd.time, "sleep"):
+            result = hd.send_line(self.PANE_ID, self.TEXT, retries=1)
+
+        self.assertFalse(result)
+        send_calls = [c for c in m_run.call_args_list
+                      if c.args[0][:3] == ["herdr", "agent", "send"]]
+        # retries=1 means the initial attempt plus one retry = 2 sends.
+        self.assertEqual(len(send_calls), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
