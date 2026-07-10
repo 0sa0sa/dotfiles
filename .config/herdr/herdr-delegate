@@ -396,6 +396,56 @@ def cmd_collect(args):
     sys.exit(3)
 
 
+def cmd_send(args):
+    manifest = load_manifest(task_dir_of(args.task_id))
+    if not send_line(manifest["pane_id"], args.text):
+        raise SystemExit("send: エコーバック検証に失敗 (2回試行)")
+
+
+def cmd_status(args):
+    rows = []
+    if not os.path.isdir(TASKS_DIR):
+        print("[]" if args.json else "(no tasks)")
+        return
+    ids = [args.task_id] if args.task_id else sorted(
+        os.listdir(TASKS_DIR),
+        key=lambda t: os.path.getmtime(os.path.join(TASKS_DIR, t)),
+        reverse=True)
+    for tid in ids:
+        d = os.path.join(TASKS_DIR, tid)
+        if not os.path.isfile(os.path.join(d, "manifest.json")):
+            continue
+        m = load_manifest(d)
+        pane = get_pane(m["pane_id"])
+        rows.append({
+            "task_id": tid,
+            "agent": m["agent"],
+            "model": m.get("model"),
+            "pane": m["pane_id"] if pane else "GONE",
+            "agent_status": pane.get("agent_status") if pane else None,
+            "result": read_result_status(d),
+            "cwd": m["cwd"],
+        })
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+    else:
+        for r in rows:
+            print(f"{r['task_id']:34} {r['agent']:6} {str(r['agent_status']):8} "
+                  f"result={r['result']} pane={r['pane']}")
+
+
+def cmd_kill(args):
+    task_dir = task_dir_of(args.task_id)
+    m = load_manifest(task_dir)
+    pane = get_pane(m["pane_id"])
+    if pane:
+        hcli("pane", "close", m["pane_id"])
+    if args.rm_worktree and m.get("worktree_path"):
+        pass  # Task 5 で実装
+    m["killed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    save_manifest(task_dir, m)
+
+
 def main():
     import argparse
 
@@ -423,6 +473,21 @@ def main():
     cp = sub.add_parser("collect")
     cp.add_argument("task_id")
     cp.set_defaults(func=cmd_collect)
+
+    sn = sub.add_parser("send")
+    sn.add_argument("task_id")
+    sn.add_argument("text")
+    sn.set_defaults(func=cmd_send)
+
+    st = sub.add_parser("status")
+    st.add_argument("task_id", nargs="?")
+    st.add_argument("--json", action="store_true")
+    st.set_defaults(func=cmd_status)
+
+    kl = sub.add_parser("kill")
+    kl.add_argument("task_id")
+    kl.add_argument("--rm-worktree", action="store_true")
+    kl.set_defaults(func=cmd_kill)
 
     args = p.parse_args()
     args.func(args)
