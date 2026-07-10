@@ -262,6 +262,7 @@ TRUST_PROMPT_MARKERS = (
     "trust this folder",
     "do you trust the files in this folder",
     "trust the files in this folder",
+    "do you trust the contents of this directory",
 )
 
 

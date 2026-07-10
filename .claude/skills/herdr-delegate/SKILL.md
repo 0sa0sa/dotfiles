@@ -73,13 +73,10 @@ exit 2 (blocked) が返ったら: stderr のペイン末尾を読み、`send` �
   （ダイアログの文言を検知して自動で Enter を送る）。`status` 確認中にこの
   画面が一瞬見えても、これは想定内でありユーザーの操作は不要。
 - **codex**: 実測 (2026-07-10) では文言が異なる
-  （`Do you trust the contents of this directory? ... 1. Yes, continue`）ため、
-  claude 向けの自動検知パターンにはマッチせず自動 Return は働かない。この
-  ダイアログで固まると `wait` は agent が働き出さないまま stalled (exit 3)
-  を返す。codex を新規ディレクトリに spawn した直後に stalled になったら、
-  まず pane を読んで trust ダイアログでないか確認し、そうなら
-  `herdr pane send-keys <pane-id> enter` で1回 Enter を送ってから
-  `wait` を再実行する（手動介入。ここが直っていない既知のギャップ）。
+  （`Do you trust the contents of this directory? ... 1. Yes, continue`）が、
+  この文言も `wait` の自動検知パターンに追加済みで、claude と同様に
+  一回限りの自動 Return ワークアラウンドで自動処理される。`status` 確認中に
+  この画面が一瞬見えても、これは想定内でありユーザーの操作は不要。
 
 ## レシピ
 

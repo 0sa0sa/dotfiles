@@ -113,6 +113,19 @@ class TestIsTrustPrompt(unittest.TestCase):
         text = "DO YOU TRUST THE FILES IN THIS FOLDER?"
         self.assertTrue(hd.is_trust_prompt(text))
 
+    def test_matches_observed_codex_dialog_text(self):
+        # 実測 (2026-07-10, codex CLI, Task 6 スモークテスト) の実際の文言
+        text = (
+            "> You are in /private/tmp/hd-smoke-codex\n\n"
+            "  Do you trust the contents of this directory? Working with "
+            "untrusted contents comes\n  with higher risk of prompt "
+            "injection. Trusting the directory allows project-local\n"
+            "  config, hooks, and exec policies to load.\n\n"
+            "› 1. Yes, continue\n  2. No, quit\n\n"
+            "  Press enter to continue"
+        )
+        self.assertTrue(hd.is_trust_prompt(text))
+
     def test_no_match_on_normal_output(self):
         text = "some normal claude output about the task\nworking...\n"
         self.assertFalse(hd.is_trust_prompt(text))
