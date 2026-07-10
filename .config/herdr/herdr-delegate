@@ -95,9 +95,152 @@ def load_manifest(task_dir):
         return json.load(f)
 
 
+# ---------- herdr I/O ----------
+
+def call(method, params):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(SOCK)
+    s.sendall((json.dumps({"id": f"delegate:{method}", "method": method, "params": params}) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    resp = json.loads(buf)
+    if "error" in resp:
+        raise RuntimeError(f"{method}: {resp['error']}")
+    return resp["result"]
+
+
+def hcli(*args):
+    proc = subprocess.run(["herdr", *args], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"herdr {' '.join(args)}: {proc.stderr.strip()}")
+    out = proc.stdout.strip()
+    if not out:
+        return {}
+    return json.loads(out).get("result", {})
+
+
+def get_pane(pane_id):
+    try:
+        return call("pane.get", {"pane_id": pane_id})["pane"]
+    except (RuntimeError, OSError):
+        return None
+
+
+def current_workspace_id():
+    ws = os.environ.get("HERDR_WORKSPACE_ID")
+    if ws:
+        return ws
+    return hcli("pane", "current")["pane"]["workspace_id"]
+
+
+# ---------- spawn ----------
+
+AGENT_CMDS = {
+    # {model} は "--model X" / "-m X" 済み文字列、{cwd} と {prompt} は wrapper 内で展開
+    "claude": 'exec claude {model} {danger} "$prompt"',
+    "codex": 'exec codex {model} {danger} --cd "$cwd" "$prompt"',
+}
+DANGER_FLAGS = {
+    "claude": "--dangerously-skip-permissions",
+    "codex": "--dangerously-bypass-approvals-and-sandbox",
+}
+MODEL_FLAGS = {"claude": "--model {m}", "codex": "-m {m}"}
+
+
+def build_wrapper(task_dir, agent, model, safe, cwd):
+    import shlex
+    import tempfile
+
+    prompt_path = os.path.join(task_dir, "prompt.md")
+    model_part = MODEL_FLAGS[agent].format(m=model) if model else ""
+    danger_part = "" if safe else DANGER_FLAGS[agent]
+    agent_cmd = AGENT_CMDS[agent].format(model=model_part, danger=danger_part, cwd='"$cwd"')
+    wrapper = tempfile.NamedTemporaryFile(
+        "w", delete=False, prefix="herdr-delegate-", suffix=".sh"
+    )
+    wrapper.write("#!/usr/bin/env bash\nset -euo pipefail\n")
+    wrapper.write(f"cwd={shlex.quote(cwd)}\n")
+    wrapper.write(f'prompt="$(cat {shlex.quote(prompt_path)})"\n')
+    wrapper.write('rm -f -- "$0"\n')
+    wrapper.write(f'cd "$cwd"\n{agent_cmd}\n')
+    wrapper.close()
+    os.chmod(wrapper.name, 0o755)
+    return wrapper.name
+
+
+def cmd_spawn(args):
+    prompt_body = args.prompt or open(args.prompt_file).read()
+    cwd = os.path.abspath(args.cwd or os.getcwd())
+    os.makedirs(TASKS_DIR, exist_ok=True)
+    slug = slugify(args.label or prompt_body[:60])
+    task_id = new_task_id(slug, TASKS_DIR)
+    task_dir = os.path.join(TASKS_DIR, task_id)
+    os.makedirs(task_dir)
+
+    with open(os.path.join(task_dir, "prompt.md"), "w") as f:
+        f.write(prompt_body.rstrip() + "\n" + contract_footer(task_dir))
+
+    worktree_path = worktree_branch = None
+    if args.worktree is not None:
+        raise SystemExit("--worktree は Task 5 で実装")  # Task 5 で置換
+
+    ws = current_workspace_id()
+    tab = hcli("tab", "create", "--workspace", ws, "--cwd", cwd,
+               "--label", task_id, "--no-focus")
+    # probe 実測 (2026-07-10, herdr 0.7.1): tab create の応答に
+    # root_pane が直接含まれる（pane_id/tab_id 込み）。pane.list による
+    # tab_id 一致検索は不要だが、将来のスキーマ変化に備え fallback を残す。
+    tab_id = tab["tab"]["tab_id"] if "tab" in tab else tab["tab_id"]
+    if "root_pane" in tab:
+        pane_id = tab["root_pane"]["pane_id"]
+    else:
+        panes = call("pane.list", {"workspace_id": ws})["panes"]
+        pane = next(p for p in panes if p["tab_id"] == tab_id)
+        pane_id = pane["pane_id"]
+
+    wrapper = build_wrapper(task_dir, args.agent, args.model, args.safe, cwd)
+    subprocess.run(["herdr", "pane", "run", pane_id, f"bash {wrapper}"],
+                   capture_output=True, check=True)
+    call("pane.rename", {"pane_id": pane_id, "label": task_id})
+
+    manifest = {
+        "task_id": task_id, "agent": args.agent, "model": args.model,
+        "pane_id": pane_id, "tab_id": tab_id, "workspace_id": ws,
+        "cwd": cwd, "worktree_path": worktree_path,
+        "worktree_branch": worktree_branch, "label": args.label,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "safe": args.safe,
+    }
+    save_manifest(task_dir, manifest)
+    print(json.dumps({"task_id": task_id, "pane_id": pane_id,
+                      "task_dir": task_dir}, ensure_ascii=False))
+
+
 def main():
-    print("not implemented", file=sys.stderr)
-    sys.exit(1)
+    import argparse
+
+    p = argparse.ArgumentParser(prog="herdr-delegate")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("spawn")
+    sp.add_argument("--agent", choices=["claude", "codex"], required=True)
+    sp.add_argument("--model")
+    sp.add_argument("--worktree", nargs="?", const="", default=None,
+                    metavar="BRANCH")
+    sp.add_argument("--cwd")
+    sp.add_argument("--label")
+    sp.add_argument("--safe", action="store_true")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--prompt")
+    g.add_argument("--prompt-file")
+    sp.set_defaults(func=cmd_spawn)
+
+    args = p.parse_args()
+    args.func(args)
 
 
 if __name__ == "__main__":
