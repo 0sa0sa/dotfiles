@@ -17,10 +17,6 @@ setopt correct
 setopt auto_cd
 function chpwd() {ls}
 
-# alias npm='pnpm'
-alias p='pnpm'
-alias run='pnpm run'
-
 alias ls='ls -G'
 alias lla='ls -laG'
 
@@ -33,9 +29,6 @@ export LSCOLORS=exfxcxdxbxegedabagacad
 export LS_COLORS='di=34:ln=35:so=32:pi=33:ex=31:bd=46;34:cd=43;34:su=41;30:sg=46;30:tw=42;30:ow=43;30'
 
 # alias c="claude"  # commented out to use function instead
-#alias cdan="claude --dangerously-skip-permissions"
-
-alias codan="codex --dangerously-bypass-approvals-and-sandbox"
 
 alias glog="git log --oneline --decorate --graph --all"
 alias gs="git status"
@@ -68,51 +61,13 @@ alias gwl='git worktree list'
 alias gwa='git worktree add'
 alias gwr='git worktree remove $(git worktree list | fzf | awk "{print \$1}")'
 
-alias d="docker"
-alias di="docker image"
-alias dis="docker images"
-alias dc="docker container"
-
-# alias kexec="kubectl exec --stdin --tty $1 -- /bin/bash"
-alias kk="kubectl kustomize"
-alias ka="kubectl apply"
-alias k="kubectl"
-alias ksp="k get pods -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | fzf"
-
-alias t="terraform"
-
-#alias ls='ls -G'
-alias lla='ls -laG'
-
-# exaのalias area
-if [[ $(command -v exa) ]]; then
-  alias e='exa --icons --git'
-  alias l=e
-  alias ls=e
-  alias ea='exa -a --icons --git'
-  alias la=ea
-  alias ee='exa -aahl --icons --git'
-  alias ll=ee
-  alias et='exa -T -L 3 -a -I "node_modules|.git|.cache" --icons'
-  alias lt=et
-  alias eta='exa -T -a -I "node_modules|.git|.cache" --color=always --icons | less -r'
-  alias lta=eta
-  alias l='clear && ls'
-fi
- 
 set -o vi
 bindkey "jj" vi-cmd-mode
-#" bashの場合
-#" bind '"jj": vi-movement-mode'
-#
-export VOLTA_HOME="$HOME/.volta"
-export PATH="$VOLTA_HOME/bin:$HOME/.local/bin:$PATH"
-export PATH="/usr/local/opt/gnu-tar/libexec/gnubin:$PATH"
-export PATH="/usr/local/opt/gnu-sed/libexec/gnubin:$PATH"
-export PATH="$HOME/.local/bin:/usr/local:$PATH"
+
+export PATH="$HOME/.local/bin:$PATH"
 
 eval "$(starship init zsh)"
-eval $(thefuck --alias)
+eval "$(direnv hook zsh)"
 eval "$(/opt/homebrew/bin/mise activate zsh)"
 
 gsw() {
@@ -135,9 +90,6 @@ rm() {
       command rm "$@"
   }
 
-autoload -U +X bashcompinit && bashcompinit
-complete -o nospace -C /opt/homebrew/bin/terraform terraform
-
 # Claude MCP config function
 cdan() {
   if [ -f "./.mcp.json" ]; then
@@ -158,32 +110,3 @@ claude() {
     command claude "$@"
   fi
 }
-source <(kubectl completion zsh)
-eval "$(direnv hook zsh)"
-. "$HOME/.local/bin/env"
-
-
-# pnpm
-export PNPM_HOME="$HOME/Library/pnpm"
-case ":$PATH:" in
-  *":$PNPM_HOME:"*) ;;
-  *) export PATH="$PNPM_HOME:$PATH" ;;
-esac
-# pnpm end
-export PATH="/opt/homebrew/opt/libpq/bin:$PATH"
-
-# bun completions
-[ -s "$HOME/.bun/_bun" ] && source "$HOME/.bun/_bun"
-
-# bun
-export BUN_INSTALL="$HOME/.bun"
-export PATH="$BUN_INSTALL/bin:$PATH"
-
-# Added by Antigravity
-export PATH="$HOME/.antigravity/antigravity/bin:$PATH"
-
-# The next line updates PATH for the Google Cloud SDK.
-if [ -f "$HOME/google-cloud-sdk/path.zsh.inc" ]; then . "$HOME/google-cloud-sdk/path.zsh.inc"; fi
-
-# The next line enables shell command completion for gcloud.
-if [ -f "$HOME/google-cloud-sdk/completion.zsh.inc" ]; then . "$HOME/google-cloud-sdk/completion.zsh.inc"; fi
