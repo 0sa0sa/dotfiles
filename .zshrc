@@ -28,6 +28,7 @@ alias awk='gawk'
 
 alias pon='predict-on'
 alias poff='predict-off'
+alias tailscale="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 export LSCOLORS=exfxcxdxbxegedabagacad
 export LS_COLORS='di=34:ln=35:so=32:pi=33:ex=31:bd=46;34:cd=43;34:su=41;30:sg=46;30:tw=42;30:ow=43;30'
@@ -73,11 +74,6 @@ alias di="docker image"
 alias dis="docker images"
 alias dc="docker container"
 
-# alias kexec="kubectl exec --stdin --tty $1 -- /bin/bash"
-alias kk="kubectl kustomize"
-alias ka="kubectl apply"
-alias k="kubectl"
-alias ksp="k get pods -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | fzf"
 
 alias t="terraform"
 
@@ -112,7 +108,6 @@ export PATH="/usr/local/opt/gnu-sed/libexec/gnubin:$PATH"
 export PATH="$HOME/.local/bin:/usr/local:$PATH"
 
 eval "$(starship init zsh)"
-eval $(thefuck --alias)
 eval "$(/opt/homebrew/bin/mise activate zsh)"
 
 gsw() {
@@ -158,7 +153,6 @@ claude() {
     command claude "$@"
   fi
 }
-source <(kubectl completion zsh)
 eval "$(direnv hook zsh)"
 . "$HOME/.local/bin/env"
 
