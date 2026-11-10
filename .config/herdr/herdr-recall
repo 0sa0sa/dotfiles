@@ -67,7 +67,17 @@ def clean_text(text):
     text = text.strip()
     if not text or is_injected(text):
         return None
-    return text[:MAX_TEXT]
+    return cap_text(text)
+
+
+TAIL_KEEP = 1000  # 末尾 (委任契約フッター等) を残す分
+
+
+def cap_text(text):
+    """上限超過は先頭+末尾を残す (末尾の委任契約フッターで task を確定できるように)。"""
+    if len(text) <= MAX_TEXT:
+        return text
+    return text[:MAX_TEXT - TAIL_KEEP - 3] + "\n…\n" + text[-TAIL_KEEP:]
 
 
 def parse_ts(value):
@@ -123,7 +133,7 @@ def parse_codex_obj(obj):
     ts = parse_ts(obj.get("timestamp"))
     if not text or ts is None:
         return None, None
-    return None, Msg(ts, role, text[:MAX_TEXT])
+    return None, Msg(ts, role, cap_text(text))
 
 
 def claude_wanted(line):
@@ -250,8 +260,22 @@ def load_tasks(tasks_dir):
     return tasks
 
 
-def match_task(tasks, source, sid, cwd, first_ts):
-    """session_id/session_path が manifest にあれば優先、なければ agent+cwd+開始時刻 (最近接) で推定。"""
+_TASK_REF_RE = re.compile(r"delegate/tasks/(dlg-[A-Za-z0-9-]+)/result\.(?:md|json)")
+
+
+def task_from_prompt(prompt_text, task_ids):
+    """worker の最初の user メッセージ (委任契約フッター) に書かれた result パスから task_id を確定する。"""
+    for tid in _TASK_REF_RE.findall(prompt_text or ""):
+        if tid in task_ids:
+            return tid
+    return None
+
+
+def match_task(tasks, source, sid, cwd, first_ts, prompt_text=None):
+    """優先順: manifest の session_id/path → プロンプト中の result パス → agent+cwd+開始時刻 (最近接) で推定。"""
+    tid = task_from_prompt(prompt_text, {m["task_id"] for m in tasks})
+    if tid:
+        return tid
     for m in tasks:
         if m.get("session_id") == sid or (m.get("session_path") or "").endswith(f"{sid}.jsonl"):
             return m["task_id"]
@@ -607,9 +631,14 @@ def recent_sessions(conn, limit=10):
 
 # ---------- CLI ----------
 
-def task_of(tasks, cache, source, sid, cwd, first_ts):
+def first_user_texts(conn, sid, limit=3):
+    rows = conn.execute("SELECT text FROM msgs WHERE sid=? AND role='user' ORDER BY ts LIMIT ?", (sid, limit))
+    return "\n".join(r[0] or "" for r in rows)
+
+
+def task_of(conn, tasks, cache, source, sid, cwd, first_ts):
     if sid not in cache:
-        cache[sid] = match_task(tasks, source, sid, cwd, first_ts)
+        cache[sid] = match_task(tasks, source, sid, cwd, first_ts, first_user_texts(conn, sid))
     return cache[sid]
 
 
@@ -669,7 +698,7 @@ def cmd_search(args):
     rows = search(conn, args.query, args.project, since, args.limit)
     tasks, cache = load_tasks(TASKS_DIR), {}
     for r in rows:
-        r["task_id"] = task_of(tasks, cache, r["source"], r["sid"], r["cwd"], r["first_ts"])
+        r["task_id"] = task_of(conn, tasks, cache, r["source"], r["sid"], r["cwd"], r["first_ts"])
     if args.json:
         out = [{k: r[k] for k in ("sid", "source", "cwd", "ts", "role", "task_id", "snippet")} for r in rows]
         print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -697,7 +726,7 @@ def cmd_show(args):
         print("該当セッションなし" if not candidates else "曖昧: " + ", ".join(candidates), file=sys.stderr)
         return 1 if not candidates else 2
     source, cwd, first_ts = conn.execute("SELECT source, cwd, first_ts FROM sessions WHERE sid=?", (sid,)).fetchone()
-    task = match_task(load_tasks(TASKS_DIR), source, sid, cwd, first_ts)
+    task = match_task(load_tasks(TASKS_DIR), source, sid, cwd, first_ts, first_user_texts(conn, sid))
     print(f"# {sid} {source} {short_path(cwd)}" + (f" task={task}" if task else ""))
     msgs, center = session_messages(conn, sid, around, args.context)
     for i, (ts, role, text) in enumerate(msgs):
@@ -712,7 +741,7 @@ def cmd_recent(args):
         return 1
     tasks, cache = load_tasks(TASKS_DIR), {}
     for s in recent_sessions(conn, args.limit):
-        task = task_of(tasks, cache, s["source"], s["sid"], s["cwd"], s["first_ts"])
+        task = task_of(conn, tasks, cache, s["source"], s["sid"], s["cwd"], s["first_ts"])
         print(
             f"{fmt_ts(s['last_ts'])} {s['source']} {s['sid'][:8]} n={s['n']} {short_path(s['cwd'])}"
             + (f" task={task}" if task else "")
