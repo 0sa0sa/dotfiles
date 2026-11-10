@@ -182,6 +182,9 @@ export PATH="$BUN_INSTALL/bin:$PATH"
 # Added by Antigravity
 export PATH="$HOME/.antigravity/antigravity/bin:$PATH"
 
+# herdr-delegate
+export PATH="$HOME/.config/herdr:$PATH"
+
 # The next line updates PATH for the Google Cloud SDK.
 if [ -f "$HOME/google-cloud-sdk/path.zsh.inc" ]; then . "$HOME/google-cloud-sdk/path.zsh.inc"; fi
 

@@ -1,0 +1,2184 @@
+#!/usr/bin/env python3
+"""herdr-ultra-watch — Claude Code Workflow (ultracode) の実行を herdr で可視化する CLI.
+
+サブコマンド: dashboard / tail / open / daemon / hook
+データ源: ~/.claude/projects/**/subagents/workflows/<run_id>/
+  journal.jsonl            started / result イベント (workflow 全体の進捗)
+  agent-<id>.jsonl         各 agent の transcript
+  agent-<id>.meta.json     description / workflowPhase / pickedEffortModel
+  ../../../workflows/scripts/<name>-<run_id>.js   meta {name, description, phases[]} (計画 phase)
+journal に error イベントは無い。状態は started のみ=running、result あり=done、
+result が error 形 (dict の error キー / "Error:" "TypeError:" 等で始まる文字列) なら error、
+running のまま STALL_SEC 以上 transcript が更新されなければ stalled とみなす。
+
+dashboard v2: 概要 -> phase -> 今 (実行中 agent の現在の動き) -> 結果 の縦積み。
+幅 <100 は狭幅、100-119 は横 strip、120 以上は 2 カラム。--once / 非 TTY は静的 1 フレーム。
+環境変数: DASH_ASCII=1 で罫線を ASCII に、NO_COLOR で色なし。
+"""
+
+import argparse
+import atexit
+import glob
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+
+STALL_SEC = 300
+PHASE_GAP_GRACE_SEC = 600  # 全 agent 完了後、未着手 phase が残ったままこの秒数動かなければ終了扱い
+POLL_SEC = 1.0
+SOURCE = "herdr-ultra-watch"
+IDLE_GIVE_UP_SEC = 600  # running 0 のまま (stalled のみ / agent 0 件) この秒数続いたら dashboard を閉じる
+RETRY_SEC = 60  # daemon が pane 未解決 / open 失敗の run を再試行する期間
+HCLI_TIMEOUT_SEC = 10
+RECENT_MAX = 40
+THINKING_SEC = 20  # これ以上 text も tool も無ければ「考え中…」
+DIM_SEC = 60
+META_INTERVAL_SEC = 5.0
+ONCE_RESULTS_CAP = 12
+ERROR_TEXT_RE = re.compile(r"^\s*(?:[A-Za-z]+)?Error\s*:")  # "Error: x" / "TypeError: x"。"Error handling added" は除外
+RUN_ID_RE = re.compile(r"wf_[0-9a-f]{8}-[0-9a-f]+")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SPINNER_ASCII = "|/-\\"
+
+
+def projects_dir():
+    return os.environ.get("CLAUDE_PROJECTS_DIR") or os.path.expanduser("~/.claude/projects")
+
+
+def state_dir():
+    return os.environ.get("HERDR_ULTRA_WATCH_DIR") or os.path.expanduser("~/.config/herdr/ultra-watch")
+
+
+# ---------- pure: 時刻・整形 ----------
+
+def parse_ts(s):
+    """ISO8601 (末尾 Z 可) -> epoch 秒。不正なら None。"""
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):
+        return None
+
+
+def fmt_elapsed(sec):
+    if sec is None:
+        return "-"
+    sec = max(0, int(sec))
+    if sec >= 3600:
+        return f"{sec // 3600}h{sec % 3600 // 60:02d}m"
+    return f"{sec // 60}m{sec % 60:02d}s"
+
+
+def fmt_eta(sec):
+    """ETA 用の粗い表記 (秒を切り上げて分単位)。"""
+    sec = max(0, int(sec))
+    if sec < 60:
+        return "<1m"
+    if sec >= 3600:
+        return f"{sec // 3600}h{sec % 3600 // 60:02d}m"
+    return f"{(sec + 59) // 60}m"
+
+
+def fmt_tokens(n):
+    if not n:
+        return "-"
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+def fmt_k(n):
+    """token 合計: 1000 以上は k 表記 (100k 以上は小数なし)。"""
+    if not n:
+        return "0"
+    if n < 1000:
+        return str(n)
+    return f"{n // 1000}k" if n >= 100000 else f"{n / 1000:.1f}k"
+
+
+def fmt_clock(ts):
+    return time.strftime("%H:%M", time.localtime(ts)) if ts else "--:--"
+
+
+def char_width(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1  # A (ambiguous) は 1 桁
+
+
+def disp_width(s):
+    return sum(char_width(c) for c in s)
+
+
+def strip_ansi(s):
+    return ANSI_RE.sub("", s)
+
+
+def clip(s, width):
+    """表示幅 width に収める (全角考慮)。超過分は末尾 … に置換。"""
+    if width <= 0:
+        return ""
+    if disp_width(s) <= width:
+        return s
+    out, used = "", 0
+    for ch in s:
+        w = char_width(ch)
+        if used + w > width - 1:
+            break
+        out, used = out + ch, used + w
+    return out + "…"
+
+
+def clip_hard(s, width):
+    """… を付けず表示幅 width 以内に切る。"""
+    out, used = "", 0
+    for ch in s:
+        w = char_width(ch)
+        if used + w > width:
+            break
+        out, used = out + ch, used + w
+    return out
+
+
+def clip_mid(s, width):
+    """中間省略 (先頭 + … + 末尾)。ラベルの区別部分 (末尾) を残す。"""
+    if width <= 0:
+        return ""
+    if disp_width(s) <= width:
+        return s
+    if width < 6:
+        return clip(s, width)
+    tail_w = (width - 1) * 3 // 5
+    head_w = width - 1 - tail_w
+    tail, used = "", 0
+    for ch in reversed(s):
+        w = char_width(ch)
+        if used + w > tail_w:
+            break
+        tail, used = ch + tail, used + w
+    return clip_hard(s, head_w) + "…" + tail
+
+
+def padl(s, width):
+    s = clip_mid(s, width)
+    return s + " " * (width - disp_width(s))
+
+
+def pad(s, width):
+    s = clip(s, width)
+    return s + " " * (width - disp_width(s))
+
+
+def wrap(text, width, max_lines=None):
+    """表示幅で折り返す。max_lines を超えたら最終行末を … にする。"""
+    width = max(1, width)
+    lines = []
+    for para in str(text).splitlines() or [""]:
+        cur, used = "", 0
+        for ch in para:
+            w = char_width(ch)
+            if used + w > width:
+                sp = cur.rfind(" ")
+                if ch != " " and 0 < sp and cur[sp + 1:].isascii():  # 英単語は単語境界で折る
+                    lines.append(cur[:sp])
+                    cur = cur[sp + 1:]
+                else:
+                    lines.append(cur)
+                    cur = ""
+                used = disp_width(cur)
+                if ch == " ":
+                    continue
+            cur, used = cur + ch, used + w
+        lines.append(cur)
+    if max_lines is not None and len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = clip(lines[-1] + "…", width) if disp_width(lines[-1]) < width else clip(lines[-1], width - 1) + "…"
+    return lines
+
+
+# ---------- pure: journal / transcript 解析 ----------
+
+def is_error_result(result):
+    if isinstance(result, dict):
+        return bool(result.get("error"))
+    if isinstance(result, str):
+        return bool(ERROR_TEXT_RE.match(result))
+    return False
+
+
+def apply_journal_event(agents, ev, events=None):
+    """journal 1 イベントを agents に畳み込む。events があれば (kind, agent_id) を出現順に積む。"""
+    kind, aid = ev.get("type"), ev.get("agentId")
+    if kind == "started" and aid:
+        agents[aid] = {"label": ev.get("label") or aid, "phase": ev.get("phase") or "-",
+                       "status": "running", "result": None}
+        if events is not None:
+            events.append(("started", aid))
+    elif kind == "result" and aid:
+        a = agents.setdefault(aid, {"label": aid, "phase": "-", "result": None})
+        a["result"] = ev.get("result")
+        a["status"] = "error" if is_error_result(ev.get("result")) else "done"
+        if events is not None:
+            events.append((a["status"], aid))
+
+
+def parse_journal(lines):
+    """journal 行列 -> {agent_id: {label, phase, status, result}} (出現順)。"""
+    agents = {}
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(ev, dict):
+            apply_journal_event(agents, ev)
+    return agents
+
+
+def new_stats():
+    return {"first_ts": None, "last_ts": None, "last_tool": None, "last_hint": "", "tool_calls": 0, "_msgs": {},
+            "last_text": "", "last_activity_ts": None, "recent": deque(maxlen=RECENT_MAX), "tool_error": False}
+
+
+def short_path(p):
+    home = os.path.expanduser("~")
+    return "~" + p[len(home):] if home != "/" and p.startswith(home + os.sep) else p
+
+
+def tool_hint(inp):
+    """tool_use の入力から人間向けの要約 1 つを取る。Bash は command の先頭 1 行、path は ~ 短縮。"""
+    if not isinstance(inp, dict):
+        return ""
+    for key in ("command", "file_path", "pattern", "path", "query", "url", "description", "prompt"):
+        val = inp.get(key)
+        if isinstance(val, str) and val.strip():
+            if key == "command":
+                return val.strip().splitlines()[0]
+            if key in ("file_path", "path"):
+                return short_path(val.strip())
+            return " ".join(val.split())
+    return ""
+
+
+def first_line(text, limit=120):
+    for ln in str(text).splitlines():
+        if ln.strip():
+            return ln.strip()[:limit]
+    return ""
+
+
+def _result_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def update_stats(stats, lines):
+    """transcript 行列を stats に畳み込む (増分可)。出力 token は message.id で重複排除。"""
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        ts = parse_ts(ev.get("timestamp"))
+        if ts is not None:
+            if stats["first_ts"] is None:
+                stats["first_ts"] = ts
+            stats["last_ts"] = ts
+        msg = ev.get("message")
+        if not isinstance(msg, dict):
+            continue
+        if ev.get("type") == "user" and isinstance(msg.get("content"), list):
+            for block in msg["content"]:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    err = bool(block.get("is_error"))
+                    stats["tool_error"] = err
+                    summ = first_line(_result_text(block.get("content")), 100)
+                    stats["recent"].append((ts, "error" if err else "result", summ))
+            continue
+        if ev.get("type") != "assistant":
+            continue
+        usage = msg.get("usage") or {}
+        if msg.get("id") and isinstance(usage.get("output_tokens"), int):
+            stats["_msgs"][msg["id"]] = usage["output_tokens"]
+        for block in msg.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                hint = tool_hint(block.get("input"))
+                stats["last_tool"], stats["last_hint"] = block.get("name"), hint
+                stats["tool_calls"] += 1
+                stats["last_activity_ts"] = ts if ts is not None else stats["last_activity_ts"]
+                stats["recent"].append((ts, "tool", f"{block.get('name')} {hint}".strip()))
+            elif block.get("type") == "text" and str(block.get("text", "")).strip():  # thinking は無視
+                line1 = first_line(block["text"])
+                stats["last_text"] = line1
+                stats["last_activity_ts"] = ts if ts is not None else stats["last_activity_ts"]
+                stats["recent"].append((ts, "text", line1))
+    return stats
+
+
+def out_tokens(stats):
+    return sum(stats["_msgs"].values())
+
+
+def agent_state(agent, stats, now):
+    """journal の status と transcript の最終更新から表示状態を決める。"""
+    if agent["status"] != "running":
+        return agent["status"]
+    last = stats["last_ts"] if stats else None
+    return "stalled" if last is not None and now - last > STALL_SEC else "running"
+
+
+def agent_elapsed(state, stats, now):
+    if not stats or stats["first_ts"] is None:
+        return None
+    end = stats["last_ts"] if state in ("done", "error") else now
+    return end - stats["first_ts"]
+
+
+def aggregate(agents, stats_by_id, now):
+    """-> (phases[(name, [row...])], counts)。row は表示用 dict。"""
+    phases, counts = {}, {"running": 0, "done": 0, "error": 0, "stalled": 0}
+    for aid, a in agents.items():
+        stats = stats_by_id.get(aid)
+        state = agent_state(a, stats, now)
+        counts[state] += 1
+        phases.setdefault(a["phase"], []).append({
+            "id": aid, "label": a["label"], "state": state,
+            "elapsed": agent_elapsed(state, stats, now),
+            "tool": stats["last_tool"] if stats else None,
+            "tokens": out_tokens(stats) if stats else 0,
+        })
+    return list(phases.items()), counts
+
+
+def all_finished(counts):
+    return sum(counts.values()) > 0 and counts["running"] == 0 and counts["stalled"] == 0
+
+
+def next_idle_since(counts, idle_since, now):
+    """running 0 かつ未完了 (stalled のみ / agent 0 件) の継続開始時刻。該当しなければ None。"""
+    if counts["running"] > 0 or all_finished(counts):
+        return None
+    return now if idle_since is None else idle_since
+
+
+def idle_expired(idle_since, now):
+    return idle_since is not None and now - idle_since >= IDLE_GIVE_UP_SEC
+
+
+def retry_expired(first_seen, now):
+    return now - first_seen > RETRY_SEC
+
+
+# ---------- pure: workflow meta (script の export const meta) ----------
+
+def _extract_meta_literal(text):
+    m = re.search(r"export\s+const\s+meta\s*=\s*\{", text)
+    if not m:
+        return None
+    start = m.end() - 1
+    depth, i, quote = 0, start, None
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "'\"`":
+            quote = ch
+        elif text.startswith("//", i):
+            nl = text.find("\n", i)
+            i = len(text) if nl < 0 else nl
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+        i += 1
+    return None
+
+
+_ESC = {"n": "\n", "t": "\t", "r": "\r"}
+
+
+def _loose_json(lit):
+    """JS object literal -> JSON 文字列 (裸キー引用 / 単引用符 / 末尾カンマ)。"""
+    out, i, n = [], 0, len(lit)
+    while i < n:
+        ch = lit[i]
+        if ch in "'\"`":
+            j, buf = i + 1, []
+            while j < n and lit[j] != ch:
+                if lit[j] == "\\" and j + 1 < n:
+                    j += 1
+                    buf.append(_ESC.get(lit[j], lit[j]))
+                else:
+                    buf.append(lit[j])
+                j += 1
+            if j >= n:
+                raise ValueError("unterminated string")
+            out.append(json.dumps("".join(buf), ensure_ascii=False))
+            i = j + 1
+        elif lit.startswith("//", i):
+            nl = lit.find("\n", i)
+            i = n if nl < 0 else nl
+        elif ch.isalpha() or ch in "_$":
+            j = i
+            while j < n and (lit[j].isalnum() or lit[j] in "_$"):
+                j += 1
+            word, k = lit[i:j], j
+            while k < n and lit[k] in " \t\r\n":
+                k += 1
+            if k < n and lit[k] == ":":
+                out.append(json.dumps(word))
+            elif word in ("true", "false", "null"):
+                out.append(word)
+            else:
+                raise ValueError(f"bare word {word}")  # 式 (変数参照など) は扱わない
+            i = j
+        elif ch == ",":
+            k = i + 1
+            while k < n and lit[k] in " \t\r\n":
+                k += 1
+            if k < n and lit[k] in "}]":
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def parse_meta_js(text):
+    """workflow script (JS は実行しない) -> {name, description, phases[{title, detail}]}。失敗は None。"""
+    try:
+        lit = _extract_meta_literal(text)
+        if lit is None:
+            return None
+        obj = json.loads(_loose_json(lit))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict) or not isinstance(obj.get("name"), str):
+        return None
+    phases = []
+    for p in obj.get("phases") or []:
+        if isinstance(p, dict) and isinstance(p.get("title"), str):
+            phases.append({"title": p["title"], "detail": str(p.get("detail") or "")})
+        elif isinstance(p, str):
+            phases.append({"title": p, "detail": ""})
+    return {"name": obj["name"], "description": str(obj.get("description") or ""), "phases": phases}
+
+
+def find_script(run_dir, base=None):
+    """run_dir -> workflow script path。session 階層ありなし両方を試し、最後に glob。"""
+    run_id = os.path.basename(os.path.normpath(run_dir))
+    for ups in (("..", "..", "..", "workflows", "scripts"), ("..", "..", "..", "..", "workflows", "scripts")):
+        hits = glob.glob(os.path.join(os.path.normpath(os.path.join(run_dir, *ups)), f"*-{run_id}.js"))
+        if hits:
+            return sorted(hits)[0]
+    base = base or projects_dir()
+    for pat in (f"*/*/workflows/scripts/*-{run_id}.js", f"*/workflows/scripts/*-{run_id}.js"):
+        hits = glob.glob(os.path.join(base, pat))
+        if hits:
+            return sorted(hits)[0]
+    return None
+
+
+# ---------- pure: 結果の 1 行化 ----------
+
+SEV_ORDER = {"high": 0, "medium": 1, "low": 2, "other": 3}
+SEV_STYLE = {"high": "31", "medium": "33", "low": "2", "other": ""}
+HARNESS_RE = re.compile(r"^\s*\[harness:[^\]]*\]\s*(?:\(Matched[^)]*\)\s*)?")
+GENERIC_RE = re.compile(r"^\W*(done|ok|完了|completed|finished|終了)\W*$", re.I)
+KEY_RE = re.compile(r"変更|修正|テスト|passed|OK")
+
+
+def norm_sev(s):
+    s = str(s or "").lower()
+    if s in ("high", "critical", "blocker", "major", "高"):
+        return "high"
+    if s in ("medium", "med", "moderate", "中"):
+        return "medium"
+    if s in ("low", "minor", "info", "nit", "低"):
+        return "low"
+    return "other"
+
+
+def sev_counts(findings):
+    c = {"high": 0, "medium": 0, "low": 0, "other": 0}
+    for f in findings:
+        c[norm_sev(f.get("severity") if isinstance(f, dict) else None)] += 1
+    return c
+
+
+def strip_md(line):
+    line = re.sub(r"^\s*(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+[.)]\s+)", "", line)
+    return re.sub(r"\*\*|__|`", "", line).strip()
+
+
+def text_gist(text):
+    text = text
+    while True:
+        new = HARNESS_RE.sub("", text, count=1)
+        if new == text:
+            break
+        text = new
+    lines = [strip_md(ln) for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln and not re.fullmatch(r"[-=_*|\s]+", ln)]
+    if not lines:
+        return ""
+    pick = lines[0]
+    if GENERIC_RE.match(pick):
+        pick = next((ln for ln in lines[1:] if KEY_RE.search(ln)), pick)
+    m = re.search(r"[。！？]|[.!?](?=\s)", pick)
+    return pick[:m.end()] if m and m.end() >= 5 else pick
+
+
+def _short_val(v):
+    if isinstance(v, (dict, list)):
+        return "…"
+    v = " ".join(str(v).split())
+    return v if len(v) <= 16 else v[:15] + "…"
+
+
+def verdict_summary(rows):
+    """done rows の dict result から bool 項目を集計 -> 'keep: True×N False×M' (3 件以上ある項目のみ)。"""
+    agg = {}
+    for r in rows:
+        res = r.get("result")
+        if r["state"] == "done" and isinstance(res, dict):
+            for k, v in res.items():
+                if isinstance(v, bool):
+                    agg.setdefault(k, {True: 0, False: 0})[v] += 1
+    parts = [f"{k} ✓{c[True]} ✗{c[False]}" for k, c in agg.items() if c[True] + c[False] >= 3]
+    return "  ".join(parts)
+
+
+def result_gist(result, width=None):
+    """result -> (1 行テキスト, kind)。kind: error / findings / text。"""
+    if is_error_result(result):
+        msg = result.get("error") if isinstance(result, dict) else result
+        msg = " ".join(str(msg).split())
+        return (clip(msg, width) if width else msg), "error"
+    if isinstance(result, dict):
+        fl = result.get("findings")
+        if isinstance(fl, list):
+            c = sev_counts(fl)
+            parts = [f"{k} {c[k]}" for k in ("high", "medium", "low", "other") if c[k]]
+            out = f"findings {len(fl)}" + (f" ({', '.join(parts)})" if parts else "")
+            first = fl[0].get("problem") if fl and isinstance(fl[0], dict) else None
+            if first and width and width - disp_width(out) >= 20:
+                out += " — " + clip(" ".join(str(first).split()), width - disp_width(out) - 3)
+            return (clip(out, width) if width else out), "findings"
+        for key in ("summary", "verdict", "status", "title"):
+            if isinstance(result.get(key), str) and result[key].strip():
+                out = text_gist(result[key]) or result[key].strip()
+                return (clip(out, width) if width else out), "text"
+        out = " ".join(f"{k}={_short_val(v)}" for k, v in result.items())
+        return (clip(out, width) if width else out), "text"
+    if isinstance(result, str):
+        out = text_gist(result)
+        return (clip(out, width) if width else out), "text"
+    out = json.dumps(result, ensure_ascii=False) if result is not None else ""
+    return (clip(out, width) if width else out), "text"
+
+
+# ---------- pure: phase / 全体進捗 / ETA ----------
+
+def phase_states(planned, rows, run_done):
+    """planned phase (meta 順) と agent rows -> phase 状態 list。meta に無い phase は末尾に追加。
+
+    state: pending / running / done / error。waiting=True は全 agent 完了だが次 agent の起動待ち。
+    """
+    order = [p["title"] for p in planned]
+    detail = {p["title"]: p.get("detail", "") for p in planned}
+    norm = {t.strip().lower(): t for t in order}
+    by = {t: [] for t in order}
+    extra = []
+    for r in rows:
+        name = r["phase"] if r["phase"] in by else norm.get(str(r["phase"]).strip().lower(), r["phase"])
+        if name not in by:
+            by[name] = []
+            extra.append(name)
+        by[name].append(r)
+    names = order + extra
+    out = []
+    for name in names:
+        rs = by[name]
+        cnt = {s: sum(r["state"] == s for r in rs) for s in ("running", "stalled", "done", "error")}
+        firsts = [r["first_ts"] for r in rs if r.get("first_ts") is not None]
+        lasts = [r["last_ts"] for r in rs if r.get("last_ts") is not None]
+        out.append({"name": name, "detail": detail.get(name, ""), "planned": name in detail, "total": len(rs),
+                    "done": cnt["done"], "error": cnt["error"], "running": cnt["running"], "stalled": cnt["stalled"],
+                    "wall": (max(lasts) - min(firsts)) if firsts and lasts else None,
+                    "first_ts": min(firsts) if firsts else None, "state": "pending", "waiting": False, "grow": False})
+    starts = [(r["first_ts"], r) for r in rows if r.get("first_ts") is not None]
+    for i, p in enumerate(out):
+        # meta 順で後ろの phase が始まった or 時系列でこの phase の最後の agent より後に別 agent が始まった
+        mine = by[p["name"]]
+        last_end = max([r["last_ts"] for r in mine if r.get("last_ts") is not None] or [None]) if mine else None
+        later_started = any(q["total"] > 0 for q in out[i + 1:]) or (
+            last_end is not None and any(ts > last_end and r not in mine for ts, r in starts))
+        if p["total"] == 0:
+            p["state"] = "pending"
+        elif p["error"]:
+            p["state"] = "error"
+        elif p["running"] or p["stalled"]:
+            p["state"] = "running"
+            p["grow"] = not later_started
+        elif later_started or run_done:
+            p["state"] = "done"
+        else:
+            p["state"], p["waiting"], p["grow"] = "running", True, True
+    return out
+
+
+def _median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    if not n:
+        return None
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def eta(phases, done_agent_secs, now, any_stalled=False, finished=False, running_elapsed=None):
+    """残り秒の推定 (表示側で ~ を付ける)。推定不能 / 停滞あり / 完了済みは None。
+
+    running_elapsed (実行中 agent の経過秒 list) を渡すと、現 phase を agent の中央値所要時間で見積もる
+    (未着手 phase は大きさ不明なので含めない。表示側で「残 ?」にする)。
+    """
+    if any_stalled or finished:
+        return None
+    if running_elapsed is not None:
+        if not running_elapsed or len(done_agent_secs) < 3:
+            return None
+        med = _median(done_agent_secs)
+        return max(0.0, max(med - e for e in running_elapsed))
+    done_ph = [p for p in phases if p["state"] == "done"]
+    if not done_ph and len(done_agent_secs) < 5:
+        return None
+    walls = [p["wall"] for p in done_ph if p["wall"] is not None]
+    typical = _median(walls) if walls else _median(done_agent_secs)
+    if typical is None:
+        return None
+    remaining = sum(p["state"] != "done" for p in phases)
+    if remaining <= 0:
+        return None
+    running = [p for p in phases if p["state"] == "running"]
+    elapsed_running = [now - p["first_ts"] for p in running if p["first_ts"] is not None]
+    spent = sum(elapsed_running) / len(elapsed_running) if elapsed_running else 0
+    return max(0.0, typical * remaining / max(1, len(running)) - spent)
+
+
+# ---------- pure: model ----------
+
+@dataclass
+class Model:
+    name: str = ""
+    run_id: str = ""
+    description: str = ""
+    now: float = 0.0
+    phases: list = field(default_factory=list)
+    rows: list = field(default_factory=list)  # agent rows (journal 順)
+    counts: dict = field(default_factory=lambda: {"running": 0, "done": 0, "error": 0, "stalled": 0})
+    finished: bool = False
+    elapsed: Optional[float] = None
+    eta: Optional[float] = None
+    tokens: int = 0
+    feed: list = field(default_factory=list)  # 新しい順
+    planned_n: int = 0
+    phases_done: int = 0
+    pending_n: int = 0  # 未着手 (agent 0 件) の planned phase 数
+    eta_unknown: bool = False  # 未着手 phase があり残り時間が見積もれない
+
+    @property
+    def seen(self):
+        return len(self.rows)
+
+    @property
+    def finished_n(self):
+        return self.counts["done"] + self.counts["error"]
+
+    @property
+    def has_alert(self):
+        return self.counts["error"] > 0 or self.counts["stalled"] > 0
+
+
+def short_model(name):
+    return re.sub(r"^claude-", "", name or "")
+
+
+def build_model(agents, stats_by_id, metas, wfmeta, run_id, events, now, start_fallback=None, stall_events=()):
+    """純関数。journal / stats / meta から表示用 Model を作る。"""
+    stats_by_id, metas = stats_by_id or {}, metas or {}
+    rows = []
+    for aid, a in agents.items():
+        st = stats_by_id.get(aid)
+        state = agent_state(a, st, now)
+        act = (st or {}).get("last_activity_ts") or (st or {}).get("last_ts")
+        meta = metas.get(aid) or {}
+        rows.append({
+            "id": aid, "label": a["label"], "phase": a["phase"], "state": state,
+            "elapsed": agent_elapsed(state, st, now), "tokens": out_tokens(st) if st else 0,
+            "tools": st["tool_calls"] if st else 0, "tool": st["last_tool"] if st else None,
+            "hint": st["last_hint"] if st else "", "text": st["last_text"] if st else "",
+            "idle": (now - act) if act else None, "tool_error": bool(st and st["tool_error"]),
+            "first_ts": st["first_ts"] if st else None, "last_ts": st["last_ts"] if st else None,
+            "recent": list(st["recent"]) if st else [], "result": a.get("result"),
+            "model": short_model(meta.get("pickedEffortModel")), "desc": meta.get("description") or "",
+        })
+    counts = {"running": 0, "done": 0, "error": 0, "stalled": 0}
+    for r in rows:
+        counts[r["state"]] += 1
+    agents_done = all_finished(counts)
+    planned = (wfmeta or {}).get("phases") or []
+    if not planned:  # fallback: journal 由来の phase 名 (出現順)
+        seen, planned = set(), []
+        for r in rows:
+            if r["phase"] not in seen:
+                seen.add(r["phase"])
+                planned.append({"title": r["phase"], "detail": ""})
+        planned_n = len(planned)
+    else:
+        planned_n = len(planned)
+    # 全 agent 完了でも未着手 phase が残る間は run 継続 (phase 間の隙間)。
+    # ただし journal が PHASE_GAP_GRACE_SEC 以上動かなければ phase スキップとみなして終了扱い。
+    row_phase = {str(r["phase"]).strip().lower() for r in rows}
+    pending_n = sum(1 for p in planned if str(p["title"]).strip().lower() not in row_phase)
+    lasts0 = [r["last_ts"] for r in rows if r["last_ts"] is not None]
+    gap_expired = bool(lasts0) and now - max(lasts0) >= PHASE_GAP_GRACE_SEC
+    finished = agents_done and (pending_n == 0 or gap_expired)
+    phases = phase_states(planned, rows, finished)
+    starts = [r["first_ts"] for r in rows if r["first_ts"] is not None]
+    start = min(starts) if starts else start_fallback
+    lasts = [r["last_ts"] for r in rows if r["last_ts"] is not None]
+    end = max(lasts) if finished and lasts else now
+    done_secs = [r["elapsed"] for r in rows if r["state"] == "done" and r["elapsed"] is not None]
+    by_id = {r["id"]: r for r in rows}
+    feed = []
+    for i, (kind, aid) in enumerate(events):
+        r = by_id.get(aid)
+        if not r:
+            continue
+        ts = r["first_ts"] if kind == "started" else r["last_ts"]
+        feed.append({"ts": ts if ts is not None else now, "kind": kind, "id": aid, "label": r["label"],
+                     "phase": r["phase"], "seq": i})
+    for j, (ts, aid) in enumerate(stall_events):
+        r = by_id.get(aid)
+        if r:
+            feed.append({"ts": ts, "kind": "stalled", "id": aid, "label": r["label"], "phase": r["phase"],
+                         "seq": len(events) + j})
+    feed.sort(key=lambda e: (e["ts"], e["seq"]), reverse=True)
+    return Model(
+        name=(wfmeta or {}).get("name") or run_id, run_id=run_id, description=(wfmeta or {}).get("description", ""),
+        now=now, phases=phases, rows=rows, counts=counts, finished=finished,
+        elapsed=(end - start) if start is not None else None,
+        eta=eta(phases, done_secs, now, counts["stalled"] > 0, finished,
+                running_elapsed=[r["elapsed"] for r in rows if r["state"] == "running" and r["elapsed"] is not None]),
+        pending_n=pending_n, eta_unknown=(not finished and (pending_n > 0 or any(p["waiting"] for p in phases))),
+        tokens=sum(r["tokens"] for r in rows), feed=feed, planned_n=planned_n,
+        phases_done=sum(p["state"] == "done" for p in phases))
+
+
+# ---------- pure: 描画 (segment = (text, style)) ----------
+
+def G():
+    """罫線・バー文字。DASH_ASCII=1 で ASCII 化 (ambiguous 幅を 2 桁で扱う端末向け)。"""
+    if os.environ.get("DASH_ASCII"):
+        return {"h": "-", "hh": "=", "v": "|", "vs": "|", "j": "+", "full": "#", "empty": ".", "wait": ".",
+                "tl": "+", "tr": "+", "bl": "+", "br": "+", "spin": SPINNER_ASCII}
+    return {"h": "─", "hh": "━", "v": "│", "vs": "┃", "j": "┯", "full": "█", "empty": "░", "wait": "·",
+            "tl": "┌", "tr": "┐", "bl": "└", "br": "┘", "spin": SPINNER}
+
+
+def paint(text, code, color):
+    return f"\x1b[{code}m{text}\x1b[0m" if color and code and text else text
+
+
+def sw(segs):
+    return sum(disp_width(t) for t, _ in segs)
+
+
+def fit_segs(segs, width):
+    """segs を表示幅 width に収める。超過時は末尾に … を付ける。"""
+    if width <= 0:
+        return []
+    if sw(segs) <= width:
+        return list(segs)
+    keep, out = width - 1, []
+    for t, s in segs:
+        if keep <= 0:
+            break
+        w = disp_width(t)
+        if w <= keep:
+            out.append((t, s))
+            keep -= w
+        else:
+            part = clip_hard(t, keep)
+            out.append((part, s))
+            keep -= disp_width(part)
+            break
+    out.append(("…", out[-1][1] if out else ""))
+    return out
+
+
+def pad_segs(segs, width):
+    segs = fit_segs(segs, width)
+    return segs + [(" " * (width - sw(segs)), "")]
+
+
+def rev_segs(segs, width):
+    return [(t, f"{s};7" if s else "7") for t, s in pad_segs(segs, width)]
+
+
+def to_line(segs, width, color):
+    out = "".join(paint(t, s, color) for t, s in fit_segs(segs, width))
+    return out + ("\x1b[0m" if color else "")
+
+
+def lr(left, right, width):
+    """左右寄せ。収まらなければ左 + 右を連結して clip。"""
+    gap = width - sw(left) - sw(right)
+    if gap >= 1:
+        return left + [(" " * gap, "")] + right
+    return fit_segs(left + [("  ", "")] + right, width)
+
+
+def layout(width):
+    return "narrow" if width < 100 else ("wide1" if width < 120 else "wide2")
+
+
+def rule(title, width, heavy=False, style="36"):
+    ch = G()["hh" if heavy else "h"]
+    left = [(ch * 2 + " ", style), (title, "1;" + style), (" ", style)]
+    return left + [(ch * max(0, width - sw(left)), style)]
+
+
+def bar(done, total, cells, style="32", open_end=False):
+    """floor で塗る。満タンは done==total かつ open_end でない時だけ (未完を満タンに見せない)。"""
+    g = G()
+    n = cells * done // total if total else 0
+    if open_end and n >= cells:
+        n = cells - 1
+    return [(g["full"] * n, style), (g["empty"] * (cells - n), "2")]
+
+
+STATE_STYLE = {"running": ("▶", "33"), "done": ("✓", "32"), "error": ("✗", "31"), "stalled": ("‖", "2;33")}
+PHASE_STYLE = {"done": ("✓", "32"), "running": ("▶", "33"), "pending": ("·", "2"), "error": ("✗", "31")}
+
+
+@dataclass
+class ViewState:
+    view: str = "main"  # main / detail / results
+    help: bool = False
+    focus: str = "now"  # now / results
+    sel: dict = field(default_factory=lambda: {"now": None, "results": None})
+    show_all: bool = False
+    feed_n: Optional[int] = None  # None=幅で自動 (120 未満は off)
+    only_err: bool = False
+    strip: bool = True
+    scroll: int = 0
+    max_scroll: int = 0
+    detail_id: Optional[str] = None
+    interactive: bool = False
+    results_cap: Optional[int] = None
+    msg: str = ""
+    msg_until: float = 0.0
+    color: bool = False
+    term_w: int = 100
+
+
+def feed_count(vs, width):
+    if vs.feed_n is not None:
+        return vs.feed_n
+    return 10 if width >= 120 else 0
+
+
+def now_list(m, vs):
+    rows = [r for r in m.rows if r["state"] in ("running", "stalled")]
+    return [r for r in rows if r["state"] == "stalled"] if vs.only_err else rows
+
+
+def results_list(m, vs):
+    """-> (表示対象 rows 新しい順, 畳んだ件数, 畳んだ phase 名)。"""
+    fin = [r for r in m.rows if r["state"] in ("done", "error")]
+    fin.sort(key=lambda r: (r["last_ts"] or 0), reverse=True)
+    if vs.only_err:
+        return [r for r in fin if r["state"] == "error"], 0, []
+    if vs.show_all or m.finished:
+        return fin, 0, []
+    done_ph = {p["name"] for p in m.phases if p["state"] == "done"}
+    vis = [r for r in fin if r["state"] == "error" or r["phase"] not in done_ph]
+    folded = [p["name"] for p in m.phases if p["state"] == "done" and any(
+        r["phase"] == p["name"] and r["state"] == "done" for r in fin)]
+    return vis, len(fin) - len(vis), folded
+
+
+def sel_id(vs, key, ids):
+    cur = vs.sel.get(key)
+    return cur if cur in ids else (ids[0] if ids else None)
+
+
+def head_rows(m, vs, w, desc_max):
+    alert = m.has_alert
+    base = "1;31" if alert else ("1;32" if m.finished else "1;36")
+    wide = w >= 100
+    time_txt = (f"完了 {fmt_elapsed(m.elapsed)}" if m.finished else f"経過 {fmt_elapsed(m.elapsed)}")
+    if m.eta_unknown and not m.finished:
+        eta_txt = "~残 ?"
+    else:
+        eta_txt = f"~残 {fmt_eta(m.eta)}" if m.eta is not None else ""
+    tok_txt = f"tok {fmt_k(m.tokens)}"
+    rows = []
+    if wide:
+        left = [("◆ ", base), (m.name, base), ("  " + m.run_id, "2")]
+        right = [(time_txt, "1;32" if m.finished and not alert else "1")]
+        if eta_txt:
+            right += [("  " + eta_txt, "")]
+        right += [("  " + tok_txt, "2")]
+        rows.append(lr(left, right, w))
+    else:
+        rows.append(lr([("◆ ", base), (m.name, base)], [(m.run_id, "2")], w))
+    if m.description:
+        ind = "  " if wide else ""
+        rows += [[(ind + ln, "")] for ln in wrap(m.description, w - len(ind), desc_max)]
+    pct = 100 * m.finished_n // m.seen if m.seen else 0
+    open_end = not m.finished and (m.pending_n > 0 or any(p["grow"] or p["waiting"] for p in m.phases))
+    if open_end:
+        pct = min(pct, 99)  # 計画が未消化の間は 100% にしない
+    plus = "+" if open_end else ""
+    chips = ([("▶%d 実行中" % m.counts["running"], "33" if m.counts["running"] else "2"),
+              (" ✓%d 完了" % m.counts["done"], "32"),
+              (" ✗%d エラー" % m.counts["error"], "1;31" if m.counts["error"] else "2"),
+              (" ‖%d 停滞" % m.counts["stalled"], "1;33" if m.counts["stalled"] else "2")] if w >= 60 else
+             [("▶%d" % m.counts["running"], "33"), (" ✓%d" % m.counts["done"], "32"),
+              (" ✗%d" % m.counts["error"], "31" if m.counts["error"] else "2"),
+              (" ‖%d" % m.counts["stalled"], "33" if m.counts["stalled"] else "2")])
+    ph = f"phase {m.phases_done}/{m.planned_n}" + (" 完了" if w >= 120 else "")
+    if m.pending_n:
+        ph += f" +未着手{m.pending_n}"
+    if wide:
+        cnt = [(f" {m.finished_n}/{m.seen}{plus} agents {pct}%", "1")]
+        cells = max(10, min(32, w - 5 - sw(cnt) - sw(chips) - len(ph) - 8))
+        rows.append([("全体 ", "1")] + bar(m.finished_n, m.seen, cells, open_end=open_end) + cnt + [("    ", "")] + chips
+                    + [("   " + ph, "36")])
+    else:
+        cells = 20 if w >= 60 else 4
+        core = ([("全体 ", "1")] if w >= 60 else []) + bar(m.finished_n, m.seen, cells, open_end=open_end) + [
+            (f" {m.finished_n}/{m.seen}{plus} {pct}%", "1")]
+        for txt, st in ((time_txt, "1;32" if m.finished and not alert else ""), (eta_txt, ""), (tok_txt, "2")):
+            if txt and sw(core) + 2 + disp_width(txt) <= w:
+                core += [("  " + txt, st)]
+        rows.append(core)
+        rows.append(chips + [("   " + ph, "36")])
+    return rows
+
+
+def phase_rows(m, w, collapse):
+    g = G()
+    cells = 8 if w >= 60 else 4
+    ps = m.phases
+    rows = []
+    if collapse:
+        done = [p for p in ps if p["state"] == "done"]
+        if done:
+            names = " ".join(p["name"] for p in done)
+            rows.append([(" ✓ ", "32"), (f"{len(done)} phase 完了 ", "32"), (f"({names})", "2")])
+            ps = [p for p in ps if p["state"] != "done"]
+    namew = min(max([disp_width(p["name"]) for p in ps] or [6]), max(6, w // 3), 16)
+    cnts = []
+    for p in ps:
+        if p["state"] == "pending":
+            c = "待機"
+        else:
+            c = f"{p['done']}/{p['total']}" + ("+" if p["grow"] and not p["waiting"] else "")
+            if p["waiting"]:
+                c += " 待機中"
+        cnts.append(c)
+    cw = max([disp_width(c) for c in cnts] or [4])
+    for p, c in zip(ps, cnts):
+        icon, st = PHASE_STYLE[p["state"]]
+        if p["state"] == "pending":
+            b = [(g["wait"] * cells, "2")]
+        else:
+            b = bar(p["done"], p["total"], cells, "31" if p["state"] == "error" else "32", p["grow"])
+        row = [(" " + icon + " ", st), (pad(p["name"], namew), "2" if p["state"] == "pending" else "1"),
+               (" ", "")] + b + [(" " + pad(c, cw), "2" if p["state"] == "pending" else "")]
+        if w >= 60 and p["detail"]:
+            row += [("  " + p["detail"], "2")]
+        rows.append(row)
+    return rows
+
+
+def strip_rows(m, w):
+    """横 strip (5 行)。box が幅に収まらなければ None。"""
+    g = G()
+    ps = m.phases
+    if not ps:
+        return []
+    iw = max(10, max(disp_width(p["name"]) for p in ps) + 2)
+    if len(ps) * (iw + 2) > w - 2:
+        return None
+    top, c1, c2, bot = [("  ", "")], [("  ", "")], [("  ", "")], [("  ", "")]
+    for p in ps:
+        icon, st = PHASE_STYLE[p["state"]]
+        name = " " + p["name"] + " "
+        top += [(g["tl"], st), (name, "1"), (g["h"] * (iw - disp_width(name)), st), (g["tr"], st)]
+        if p["state"] == "pending":
+            t, b = "待機", [(g["wait"] * 8, "2")]
+        else:
+            t = f"{p['done']}/{p['total']}" + ("+" if p["grow"] and not p["waiting"] else "")
+            b = bar(p["done"], p["total"], 8, "31" if p["state"] == "error" else "32", p["grow"])
+        c1 += [(g["v"], st), (pad(f" {icon} {t}", iw), st if p["state"] != "pending" else "2"), (g["v"], st)]
+        c2 += [(g["v"], st), (" ", "")] + b + [(" " * (iw - 9), ""), (g["v"], st)]
+        bot += [(g["bl"], st), (g["h"] * iw, st), (g["br"], st)]
+    return [top, c1, c2, bot]
+
+
+def agent_head(r, m, w, lab_w, frame):
+    g = G()
+    if r["state"] == "stalled":
+        icon, st = "‖", "2;33"
+        el = f"停滞 {fmt_elapsed(r['idle'])}" if r["idle"] is not None else "停滞"
+    else:
+        icon, st = g["spin"][frame % len(g["spin"])], "33"
+        el = fmt_elapsed(r["elapsed"])
+    row = [(" " + icon + " ", st), (padl(r["label"], lab_w), "1"), ("  " + clip(r["phase"], 12), "36"),
+           ("  " + el, "2" if r["state"] == "stalled" else ""), (" " + fmt_tokens(r["tokens"]), "2")]
+    if w >= 100 and r["tools"]:
+        row += [(f" tools{r['tools']}", "2")]
+    if w >= 120 and r["model"]:
+        row += [(" " + r["model"], "2")]
+    if r["tool_error"]:
+        row += [(" ! tool error", "31")]
+    return row
+
+
+def agent_tool_row(r, indent="    "):
+    if not r["tool"]:
+        return [(indent + "(起動待ち)", "2")]
+    row = [(indent + pad(r["tool"], 6), "36"), ("  " + r["hint"], "")]
+    return row
+
+
+def agent_text_row(r, w, indent="    "):
+    idle = r["idle"]
+    if idle is None:
+        return [(indent + "起動中…", "2")]
+    if idle > THINKING_SEC:
+        if idle > DIM_SEC:
+            return [(indent + f"考え中… {int(idle)}s", "2")]
+        return [(indent + "考え中…", "")]
+    if not r["text"]:
+        return [(indent + "…", "2")]
+    return [(indent + "「" + r["text"] + "」", "2" if idle > DIM_SEC else "")]
+
+
+def now_rows(m, vs, w, frame, nl, cap, sel):
+    rows = now_list(m, vs)
+    out = []
+    if not rows and m.finished:
+        fin = [r for r in m.rows if r["state"] == "done" and r.get("result") is not None]
+        if fin:
+            last = max(fin, key=lambda r: r["last_ts"] or 0)
+            body = result_rows_full(last["result"], max(20, w - 2))
+            cap_n = 14
+            out = [[(" ✓ 全 agent 完了  最終成果: ", "32"), (clip_mid(last["label"], max(8, w - 24)), "1")]]
+            out += [[(" ", "")] + ln for ln in body[:cap_n]]
+            if len(body) > cap_n:
+                out.append([(f" … +{len(body) - cap_n} 行 (⏎ 詳細)", "2")])
+            return out
+    if not rows:
+        return [[(" " + ("全 agent 完了" if m.finished else ("次 phase 待ち" if m.pending_n or any(p["waiting"] for p in m.phases) else "実行中の agent なし")), "2")]]
+    lab_w = min(max(disp_width(r["label"]) for r in rows), max(8, w - 34))
+    shown = rows if cap is None else rows[:cap]
+    for r in shown:
+        head = agent_head(r, m, w, lab_w, frame)
+        if nl <= 1 and r["tool"]:
+            head += [("  " + r["tool"] + " " + r["hint"], "2")]
+        out.append(rev_segs(head, w) if vs.interactive and vs.focus == "now" and r["id"] == sel else head)
+        if nl >= 2:
+            out.append(agent_tool_row(r))
+        if nl >= 3 and w >= 60:
+            out.append(agent_text_row(r, w))
+    if len(rows) > len(shown):
+        out.append([(f" … +{len(rows) - len(shown)} 実行中", "2")])
+    return out
+
+
+def result_row(r, w, lab_w, selected):
+    icon, st = STATE_STYLE[r["state"]]
+    head = [(" " + icon + " ", st), (padl(r["label"], lab_w), ""), (" " + f"{fmt_elapsed(r['elapsed']):>6}", "2"),
+            ("  ", "")]
+    gist, kind = result_gist(r["result"], max(0, w - sw(head)))
+    row = head + [(gist, "31" if kind == "error" else "")]
+    return rev_segs(row, w) if selected else row
+
+
+def results_rows(m, vs, w, k, sel):
+    vis, hidden, folded = results_list(m, vs)
+    if not vis and not hidden:
+        return []
+    lab_w = min(max([disp_width(r["label"]) for r in vis] or [8]), 18 if w < 70 else max(18, min(40, (w - 14) // 2)))
+    start = 0
+    if sel in [r["id"] for r in vis]:
+        idx = [r["id"] for r in vis].index(sel)
+        start = max(0, min(idx - k + 1, len(vis) - k)) if idx >= k else 0
+    shown = vis[start:start + k]
+    out = []
+    vsum = verdict_summary(m.rows) if m.finished else ""
+    if vsum:
+        out.append([(" 集計 ", "1"), (clip(vsum, max(0, w - 7)), "")])
+    out += [result_row(r, w, lab_w, vs.interactive and vs.focus == "results" and r["id"] == sel) for r in shown]
+    more = len(vis) - len(shown)
+    if more > 0 or hidden:
+        txt = f"… +{more + hidden} 完了" + (f" (畳み済 phase: {' '.join(folded)})" if hidden else "")
+        out.append([(" " + txt, "2")])
+    return out
+
+
+def feed_rows(m, n, w):
+    out = []
+    for e in m.feed[:n]:
+        t = [(" " + fmt_clock(e["ts"]) + " ", "2")]
+        if e["kind"] == "started":
+            out.append(t + [("▶ ", "33"), (clip_mid(e["label"], max(10, w - 24)), ""), (f" 開始 ({e['phase']})", "2")])
+        elif e["kind"] == "stalled":
+            out.append(t + [("‖ ", "33"), (e["label"], "33"), (" 停滞", "33")])
+        else:
+            r = next((x for x in m.rows if x["id"] == e["id"]), None)
+            lab = padl(e["label"], min(24, max(12, w // 3)))
+            gist, kind = result_gist(r["result"], max(0, w - 12 - disp_width(lab))) if r else ("", "text")
+            icon, st = STATE_STYLE[e["kind"]]
+            out.append(t + [(icon + " ", st), (lab + " ", "31" if e["kind"] == "error" else ""),
+                            (gist, "31" if kind == "error" else "2")])
+    return out
+
+
+def footer_row(vs, w, now):
+    if vs.msg and now < vs.msg_until:
+        return [(" " + vs.msg, "1;33")]
+    if w >= 120:
+        txt = " q終了 j/k選択 ⏎詳細 t tail T全tail a全表示 f feed e異常のみ p strip切替 r結果 R再読込 ?"
+    elif w >= 60:
+        txt = " q終了 j/k選択 ⏎詳細 t tail a全表示 f feed ?"
+    else:
+        txt = " q終了 j/k ⏎ t a f ?"
+    return [(txt, "2")]
+
+
+def summary_line(m, w):
+    run = [p["name"] for p in m.phases if p["state"] == "running"]
+    cur = run[0] if run else (m.phases[-1]["name"] if m.phases else "")
+    c = m.counts
+    return [(f"▶{c['running']} ✓{m.finished_n}/{m.seen} {cur}", "1;31" if m.has_alert else "1")]
+
+
+def compose(m, vs, W, H, level, frame):
+    mode = layout(W)
+    top = head_rows(m, vs, W, 1 if level >= 7 else 2)
+    if level < 9:
+        top.append(rule("フェーズ", W))
+        sr = strip_rows(m, W) if mode != "narrow" and vs.strip else None
+        top += sr if sr is not None else phase_rows(m, W, collapse=level >= 3)
+    nl = 3 if level < 4 else (2 if level < 5 else 1)
+    cap = 3 if level >= 6 else None
+    now_ids = [r["id"] for r in now_list(m, vs)]
+    res_ids = [r["id"] for r in results_list(m, vs)[0]]
+    nsel, rsel = sel_id(vs, "now", now_ids), sel_id(vs, "results", res_ids)
+    n_now = len(now_ids)
+    foot = footer_row(vs, W, m.now)
+    feed_n = 0 if level >= 1 else min(feed_count(vs, W), len(m.feed))
+    if mode != "wide2":
+        rows = top + [rule(f"今 ({n_now})", W)] + now_rows(m, vs, W, frame, nl, cap, nsel)
+        if feed_n:
+            rows += [rule("FEED", W)] + feed_rows(m, feed_n, W)
+        if level < 8:
+            avail = H - len(rows) - 1 - 1
+            vis, hidden, _ = results_list(m, vs)
+            natural = len(vis)
+            k = min(natural, max(avail - (1 if natural or hidden else 0), 3))
+            if vs.results_cap is not None:
+                k = min(k, vs.results_cap)
+            rr = results_rows(m, vs, W, max(k, 0), rsel)
+            if rr:
+                rows += [rule("結果 (新しい順)", W)] + rr
+        rows.append(foot)
+        return [to_line(r, W, vs.color) for r in rows]
+    # 2 カラム: 左 今 / 右 結果 + FEED
+    g = G()
+    lw = max(50, (W - 3) * 11 // 20)
+    rw = W - 3 - lw
+    left = now_rows(m, vs, lw, frame, nl, cap, nsel)
+    body_h = max(len(left), H - len(top) - 2)
+    right = []
+    if level < 8:
+        vis, hidden, _ = results_list(m, vs)
+        room = body_h - (feed_n + 1 if feed_n else 0)
+        k = min(len(vis), max(room - (1 if (vis or hidden) else 0), 3))
+        if vs.results_cap is not None:
+            k = min(k, vs.results_cap)
+        right = results_rows(m, vs, rw, max(k, 0), rsel)
+    if feed_n:
+        right += [[(" " + g["h"] * 2 + " FEED " + g["h"] * max(0, rw - 9), "36")]] + feed_rows(m, feed_n, rw)
+    body_h = max(len(left), len(right))
+    lj = [(g["hh"] * 2 + " ", "36"), (f"今 ({n_now})", "1;36"), (" ", "36")]
+    lj += [(g["hh"] * max(0, lw + 1 - sw(lj)), "36"), (g["j"], "36")]
+    rj = [(g["hh"] + " ", "36"), ("結果 / FEED", "1;36"), (" ", "36")]
+    rj += [(g["hh"] * max(0, rw + 1 - sw(rj)), "36")]
+    rows = top + [lj + rj]
+    for i in range(body_h):
+        lseg = left[i] if i < len(left) else []
+        rseg = right[i] if i < len(right) else []
+        rows.append(pad_segs(lseg, lw) + [(" " + g["vs"] + " ", "2")] + rseg)
+    rows.append(foot)
+    return [to_line(r, W, vs.color) for r in rows]
+
+
+def render_frame(m, vs, width, height, frame=0, color=False):
+    """純関数: Model + ViewState + 画面サイズ -> 行リスト (各行は表示幅 <= width)。"""
+    vs.color = color
+    if vs.help:
+        return render_help(vs, width, height, color)
+    if vs.view == "detail":
+        return render_scrolled(vs, width, height, color, detail_rows(m, vs, width), "Esc戻る j/k スクロール")
+    if vs.view == "results":
+        return render_scrolled(vs, width, height, color, results_view_rows(m, width), "Esc/r 戻る j/k スクロール")
+    if height < 8:
+        return [to_line(summary_line(m, width), width, color)]
+    lines = compose(m, vs, width, height, 0, frame)
+    level = 0
+    while len(lines) > height and level < 9:
+        level += 1
+        lines = compose(m, vs, width, height, level, frame)
+    if len(lines) > height:  # 最後の砦: 末尾 (footer) を残して上から切る
+        lines = lines[:height - 1] + lines[-1:]
+    return lines
+
+
+# ---------- pure: detail / results / help ----------
+
+def finding_rows(f, w):
+    sev = norm_sev(f.get("severity")) if isinstance(f, dict) else "other"
+    if not isinstance(f, dict):
+        return [[("  " + str(f), "")]]
+    loc = f.get("file") or ""
+    if loc and f.get("line") is not None:
+        loc += f":{f['line']}"
+    text = " ".join(str(f.get("problem") or "").split())
+    fix = " ".join(str(f.get("fix") or "").split())
+    rows = []
+    first = True
+    for ln in wrap(f"{loc} {text}".strip(), max(10, w - 12)):
+        rows.append([("  " + (f"[{sev}]".ljust(8) if first else " " * 8) + " ", SEV_STYLE[sev]), (ln, "")])
+        first = False
+    if fix:
+        for i, ln in enumerate(wrap("fix: " + fix, max(10, w - 12))):
+            rows.append([(" " * 11, ""), (ln, "2")])
+    return rows
+
+
+def result_rows_full(result, w):
+    if result is None:
+        return [[("  (結果なし)", "2")]]
+    if is_error_result(result):
+        msg = result.get("error") if isinstance(result, dict) else result
+        return [[("  " + ln, "31")] for ln in wrap(str(msg), w - 2)]
+    if isinstance(result, dict):
+        rows = []
+        fl = result.get("findings")
+        if isinstance(fl, list):
+            c = sev_counts(fl)
+            rows.append([(f"  findings {len(fl)}: high {c['high']} · medium {c['medium']} · low {c['low']}", "1")])
+            for f in sorted(fl, key=lambda f: SEV_ORDER[norm_sev(f.get("severity") if isinstance(f, dict) else None)]):
+                rows += finding_rows(f, w)
+            rest = {k: v for k, v in result.items() if k != "findings"}
+            if not rest:
+                return rows
+            result = rest
+        body = json.dumps(result, ensure_ascii=False, indent=2)
+        return rows + [[("  " + ln, "")] for t in body.splitlines() for ln in wrap(t, w - 2)]
+    if isinstance(result, str):
+        return [[("  " + ln, "")] for t in result.splitlines() for ln in (wrap(t, w - 2) if t else [""])]
+    return [[("  " + json.dumps(result, ensure_ascii=False), "")]]
+
+
+def detail_rows(m, vs, w):
+    r = next((x for x in m.rows if x["id"] == vs.detail_id), None)
+    if not r:
+        return [[("agent が見つからない", "31")]]
+    icon, st = STATE_STYLE[r["state"]]
+    rows = [[("◆ ", "1;36"), (r["label"], "1;36"), ("  " + r["phase"], "36")],
+            [(icon + " " + r["state"], st), (f"  経過 {fmt_elapsed(r['elapsed'])}  tok {fmt_tokens(r['tokens'])}"
+                                              f"  tools {r['tools']}  {r['model']}", ""), ("  " + r["id"], "2")]]
+    if r["desc"]:
+        rows.append([(r["desc"], "2")])
+    rows.append(rule("今", w))
+    if r["state"] in ("running", "stalled"):
+        rows.append(agent_tool_row(r, "  ") + ([(" ! tool error", "31")] if r["tool_error"] else []))
+        rows.append(agent_text_row(r, w, "  "))
+    else:
+        rows.append([("  終了済み", "2")])
+    rows.append(rule("直近の動き", w))
+    if r["recent"]:
+        for ts, kind, summ in r["recent"]:
+            kst = {"tool": "36", "error": "31", "result": "2", "text": ""}.get(kind, "")
+            rows.append([(" " + (time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "--:--:--") + " ", "2"),
+                         (pad(kind, 6), kst), (" " + summ, kst if kind == "error" else "")])
+    else:
+        rows.append([("  (履歴なし: 完了 agent は最終読込後に破棄)", "2")])
+    rows.append(rule("結果", w))
+    if r["state"] in ("running", "stalled"):
+        rows.append([("  (実行中)", "2")])
+    else:
+        rows += result_rows_full(r["result"], w)
+    return rows
+
+
+def results_view_rows(m, w):
+    fin = sorted([r for r in m.rows if r["state"] in ("done", "error")], key=lambda r: r["last_ts"] or 0,
+                 reverse=True)
+    allf = [f for r in fin if isinstance(r["result"], dict) and isinstance(r["result"].get("findings"), list)
+            for f in r["result"]["findings"]]
+    c = sev_counts(allf)
+    rows = [[(f" findings 計 {len(allf)}: ", "1"), (f"high {c['high']}", "31"), (" · ", "2"),
+             (f"medium {c['medium']}", "33"), (" · ", "2"), (f"low {c['low']}", "2")], rule("結果一覧", w)]
+    for r in fin:
+        icon, st = STATE_STYLE[r["state"]]
+        rows.append([(" " + icon + " ", st), (r["label"], "1"), ("  " + r["phase"], "36"),
+                     (f"  {fmt_elapsed(r['elapsed'])}", "2")])
+        res = r["result"]
+        if isinstance(res, dict) and isinstance(res.get("findings"), list) and res["findings"]:
+            for f in sorted(res["findings"], key=lambda f: SEV_ORDER[norm_sev(f.get("severity") if isinstance(f, dict) else None)]):
+                rows += finding_rows(f, w)
+        else:
+            gist, kind = result_gist(res, max(0, w - 6))
+            rows.append([("    " + gist, "31" if kind == "error" else "")])
+    return rows
+
+
+HELP_LINES = [
+    ("q / Ctrl-C", "終了"), ("j k / ↑ ↓", "NOW・結果の選択移動 (g G で先頭・末尾)"), ("Tab", "NOW と結果の間でフォーカス移動"),
+    ("Enter", "選択 agent の detail"), ("Esc / Backspace", "detail・overlay から戻る"),
+    ("t", "選択 agent の tail ペインを開く (二重起動は通知のみ)"), ("T", "実行中 agent の tail を最大 4 つ (新 tab)"),
+    ("a", "完了 agent の全表示 / 畳み表示"), ("f", "FEED off -> 5 -> 10 -> 20 件"), ("e", "エラー・停滞のみ"),
+    ("p", "phase 表示 strip / list"), ("r", "結果ビュー (findings 集計)"), ("R", "強制再読込"), ("?", "このヘルプ"),
+]
+
+
+def render_help(vs, w, h, color):
+    rows = [[("◆ ", "1;36"), ("キー操作", "1;36")], rule("ヘルプ", w)]
+    rows += [[(" " + pad(k, 16), "36"), (v, "")] for k, v in HELP_LINES]
+    rows = rows[:max(1, h - 1)] + [[(" 何かキーで戻る", "2")]]
+    return [to_line(r, w, color) for r in rows][:h]
+
+
+def render_scrolled(vs, w, h, color, rows, hint):
+    body_h = max(1, h - 1)
+    vs.max_scroll = max(0, len(rows) - body_h)
+    vs.scroll = max(0, min(vs.scroll, vs.max_scroll))
+    view = rows[vs.scroll:vs.scroll + body_h]
+    foot = f" {hint}  ({vs.scroll + 1}-{min(len(rows), vs.scroll + body_h)}/{len(rows)})"
+    return [to_line(r, w, color) for r in view] + [to_line([(foot, "2")], w, color)]
+
+
+# ---------- pure: tail 整形 ----------
+
+def format_event(ev, width):
+    """transcript 1 行 -> 表示行のリスト (assistant の text / tool_use のみ)。"""
+    msg = ev.get("message")
+    if ev.get("type") != "assistant" or not isinstance(msg, dict):
+        return []
+    ts = parse_ts(ev.get("timestamp"))
+    stamp = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "--:--:--"
+    out = []
+    for block in msg.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text" and block.get("text", "").strip():
+            out.append(clip(f"{stamp}  {block['text'].strip().splitlines()[0]}", width))
+        elif block.get("type") == "tool_use":
+            hint = tool_hint(block.get("input"))
+            out.append(clip(f"{stamp}  > {block.get('name')} {hint}".rstrip(), width))
+    return out
+
+
+# ---------- pure: 探索 ----------
+
+def session_id_of(run_dir):
+    """<proj>/<session-uuid>/subagents/workflows/<run> から session id を取る。無ければ None。"""
+    parts = os.path.normpath(run_dir).split(os.sep)
+    if len(parts) >= 5 and parts[-2] == "workflows" and parts[-3] == "subagents" and UUID_RE.match(parts[-4]):
+        return parts[-4]
+    return None
+
+
+def find_run_dirs(base=None):
+    """journal.jsonl を持つ run dir を更新が新しい順に返す。"""
+    base = base or projects_dir()
+    pats = [os.path.join(base, "*", "*", "subagents", "workflows", "wf_*"),
+            os.path.join(base, "*", "subagents", "workflows", "wf_*")]
+    dirs = {d for p in pats for d in glob.glob(p) if os.path.exists(os.path.join(d, "journal.jsonl"))}
+    return sorted(dirs, key=lambda d: os.path.getmtime(os.path.join(d, "journal.jsonl")), reverse=True)
+
+
+def resolve_run_dir(arg, base=None):
+    """パス / run id / None(=最新) -> run dir。見つからなければ None。"""
+    if arg and os.path.isdir(arg):
+        return os.path.abspath(arg)
+    runs = find_run_dirs(base)
+    if not arg:
+        return runs[0] if runs else None
+    return next((d for d in runs if os.path.basename(d) == arg), None)
+
+
+def resolve_agent(agents, query):
+    """agent id (前方一致) か label (完全一致) -> agent_id。曖昧/なしは None。"""
+    hits = [aid for aid, a in agents.items() if aid == query or a["label"] == query]
+    hits = hits or [aid for aid in agents if aid.startswith(query)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def locate_from_hook(payload, base=None):
+    """PostToolUse hook JSON -> run dir。tool_response 内の run id、無ければ session の最新 run。"""
+    m = RUN_ID_RE.search(json.dumps(payload.get("tool_response", "")))
+    if m:
+        found = resolve_run_dir(m.group(0), base)
+        if found:
+            return found
+    sid = payload.get("session_id")
+    runs = [d for d in find_run_dirs(base) if sid and session_id_of(d) == sid]
+    return runs[0] if runs else None
+
+
+def new_runs(known, current):
+    return [d for d in current if d not in known]
+
+
+def owner_pane(session_id, agents):
+    """herdr agent list の結果から session id を持つ pane id を返す。"""
+    for a in agents:
+        if (a.get("agent_session") or {}).get("value") == session_id:
+            return a.get("pane_id")
+    return None
+
+
+def find_key(obj, key):
+    """入れ子の dict/list から最初の key の値を探す (herdr 応答の形差分に耐える)。"""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        obj = list(obj.values())
+    if isinstance(obj, list):
+        for v in obj:
+            r = find_key(v, key)
+            if r is not None:
+                return r
+    return None
+
+
+# ---------- IO: ledger 読み込み (増分) ----------
+
+def read_agent_meta(run_dir, aid):
+    try:
+        with open(os.path.join(run_dir, f"agent-{aid}.meta.json"), encoding="utf-8") as f:
+            meta = json.load(f)
+        return meta if isinstance(meta, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+class RunReader:
+    """journal と各 transcript を増分 (バイト offset) で読み、巨大 transcript の再パースを避ける。
+
+    完了 agent は最終 1 回読んだ後に読込を止め、recent / last_text を破棄する。
+    agent meta (.meta.json) は初出時に 1 回だけ読む。workflow script は mtime 変化時のみ再読込。
+    """
+
+    def __init__(self, run_dir):
+        self.run_dir = run_dir
+        self.run_id = os.path.basename(os.path.normpath(run_dir))
+        self.agents, self.events, self.stats, self.metas = {}, [], {}, {}
+        self._offsets = {}
+        self._finalized = set()
+        self._script = None
+        self._script_mtime = None
+        self._script_checked = 0.0
+        self.wfmeta = None
+
+    def new_lines(self, path):
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return []
+        off = self._offsets.get(path, 0)
+        if size <= off:
+            return []
+        with open(path, "rb") as f:
+            f.seek(off)
+            data = f.read()
+        end = data.rfind(b"\n") + 1  # 書きかけの末尾行は次回に回す
+        self._offsets[path] = off + end
+        # splitlines() は U+2028/2029/0085 等でも割るので使わない (Node の JSON は U+2028 を生で出す)
+        return [ln.decode("utf-8", "replace").rstrip("\r") for ln in data[:end].split(b"\n") if ln.strip()]
+
+    def journal(self):
+        for line in self.new_lines(os.path.join(self.run_dir, "journal.jsonl")):
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict):
+                apply_journal_event(self.agents, ev, self.events)
+        return self.agents
+
+    def snapshot(self):
+        agents = self.journal()
+        for aid, a in agents.items():
+            if aid in self._finalized:
+                continue
+            if aid not in self.metas:
+                self.metas[aid] = read_agent_meta(self.run_dir, aid)
+            st = self.stats.setdefault(aid, new_stats())
+            update_stats(st, self.new_lines(os.path.join(self.run_dir, f"agent-{aid}.jsonl")))
+            if a["status"] != "running":  # 最終読込済み: 以後は stat しない
+                st["recent"].clear()
+                st["last_text"], st["last_hint"] = "", ""
+                self._finalized.add(aid)
+        return agents, self.stats
+
+    def workflow_meta(self, force=False):
+        now = time.time()
+        if self._script is None and (force or now - self._script_checked > 30):
+            self._script_checked = now
+            self._script = find_script(self.run_dir)
+        if self._script:
+            try:
+                mt = os.path.getmtime(self._script)
+            except OSError:
+                return self.wfmeta
+            if force or mt != self._script_mtime:
+                self._script_mtime = mt
+                try:
+                    with open(self._script, encoding="utf-8") as f:
+                        self.wfmeta = parse_meta_js(f.read())
+                except OSError:
+                    pass
+        return self.wfmeta
+
+    def journal_mtime(self):
+        try:
+            return os.path.getmtime(os.path.join(self.run_dir, "journal.jsonl"))
+        except OSError:
+            return None
+
+    def model(self, now, stall_events=()):
+        agents, stats = self.snapshot()
+        return self.build(now, stall_events)
+
+    def build(self, now, stall_events=()):
+        return build_model(self.agents, self.stats, self.metas, self.workflow_meta(), self.run_id, self.events, now,
+                           self.journal_mtime(), stall_events)
+
+
+# ---------- IO: herdr ----------
+
+def hcli(*args):
+    """herdr CLI を呼ぶ。失敗 (未インストール / timeout / 不正 JSON 含む) は RuntimeError に統一。"""
+    cmd = " ".join(args)
+    try:
+        proc = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=HCLI_TIMEOUT_SEC)
+        if proc.returncode != 0:
+            raise RuntimeError(f"herdr {cmd}: {proc.stderr.strip()}")
+        out = proc.stdout.strip()
+        return json.loads(out).get("result", {}) if out else {}
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"herdr {cmd}: {HCLI_TIMEOUT_SEC}s で応答なし") from None
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"herdr {cmd}: {e}") from e
+
+
+def in_herdr():
+    return os.environ.get("HERDR_ENV") == "1" or bool(os.environ.get("HERDR_PANE_ID"))
+
+
+def self_command(*args):
+    return " ".join(shlex.quote(a) for a in [sys.executable, os.path.realpath(__file__), *args])
+
+
+def report_status(text, title=None):
+    """自ペインの custom status を更新 (best-effort)。title があれば pane title も設定、None なら解除。"""
+    pane = os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        return
+    try:
+        hcli("pane", "report-metadata", pane, "--source", SOURCE, "--custom-status", text, "--ttl-ms", "30000",
+             *(["--title", title] if title else ["--clear-title"]))
+    except (RuntimeError, OSError, ValueError):
+        pass
+
+
+def split_pane(target, direction):
+    ref = ["--pane", target] if target else ["--current"]
+    res = hcli("pane", "split", *ref, "--direction", direction, "--no-focus")
+    pane_id = find_key(res, "pane_id")
+    if not pane_id:
+        raise RuntimeError(f"pane split の応答に pane_id が無い: {res}")
+    return pane_id
+
+
+def run_in_pane(pane_id, argv):
+    hcli("pane", "run", pane_id, self_command(*argv))
+
+
+def close_panes(pane_ids):
+    """途中失敗で残った空ペインを閉じる (best-effort)。"""
+    for pane_id in pane_ids:
+        try:
+            hcli("pane", "close", pane_id)
+        except RuntimeError:
+            pass
+
+
+def claim_run(run_id):
+    """同じ run を hook と daemon が二重に開かないよう排他マーカーを作る。取れたら True。"""
+    d = os.path.join(state_dir(), "opened")
+    os.makedirs(d, exist_ok=True)
+    try:
+        os.close(os.open(os.path.join(d, run_id), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        return True
+    except FileExistsError:
+        return False
+
+
+def release_run(run_id):
+    """open に失敗した run の排他マーカーを戻し、再試行可能にする。"""
+    try:
+        os.unlink(os.path.join(state_dir(), "opened", run_id))
+    except OSError:
+        pass
+
+
+
+# ---------- pure: キー入力 / 差分描画 / 通知 ----------
+
+KEY_ESCAPES = {"\x1b[A": "up", "\x1b[B": "down", "\x1b[C": "right", "\x1b[D": "left", "\x1bOA": "up", "\x1bOB": "down"}
+FEED_CYCLE = (0, 5, 10, 20)
+
+
+def parse_keys(data):
+    """端末入力のバイト列 (decode 済み) -> キー名のリスト。"""
+    keys, i = [], 0
+    while i < len(data):
+        ch = data[i]
+        if ch == "\x1b":
+            seq = data[i:i + 3]
+            if seq in KEY_ESCAPES:
+                keys.append(KEY_ESCAPES[seq])
+                i += 3
+            elif data[i + 1:i + 2] in ("[", "O"):  # 未対応の CSI: 終端文字まで読み捨て
+                j = i + 2
+                while j < len(data) and not data[j].isalpha() and data[j] != "~":
+                    j += 1
+                i = j + 1
+            else:
+                keys.append("esc")
+                i += 1
+        else:
+            keys.append({"\r": "enter", "\n": "enter", "\t": "tab", "\x7f": "backspace", "\x08": "backspace",
+                         "\x03": "q"}.get(ch, ch))
+            i += 1
+    return keys
+
+
+def nav_ids(m, vs):
+    if vs.focus == "now":
+        return [r["id"] for r in now_list(m, vs)]
+    return [r["id"] for r in results_list(m, vs)[0]]
+
+
+def handle_key(vs, m, key):
+    """vs を更新し、副作用が要る場合は action 名 (quit / tail / tails / reload) を返す。"""
+    if key == "q":
+        return "quit"
+    if vs.help:
+        vs.help = False
+        return None
+    if key == "?":
+        vs.help = True
+        return None
+    if vs.view in ("detail", "results"):
+        if key in ("esc", "backspace") or (vs.view == "results" and key == "r"):
+            vs.view, vs.scroll = "main", 0
+        elif key in ("j", "down"):
+            vs.scroll += 1
+        elif key in ("k", "up"):
+            vs.scroll = max(0, vs.scroll - 1)
+        elif key == "g":
+            vs.scroll = 0
+        elif key == "G":
+            vs.scroll = vs.max_scroll
+        elif key == "R":
+            return "reload"
+        return None
+    ids = nav_ids(m, vs)
+    cur = sel_id(vs, vs.focus, ids)
+    if key in ("j", "down", "k", "up") and ids:
+        i = ids.index(cur) + (1 if key in ("j", "down") else -1)
+        vs.sel[vs.focus] = ids[max(0, min(len(ids) - 1, i))]
+    elif key in ("g", "G") and ids:
+        vs.sel[vs.focus] = ids[0] if key == "g" else ids[-1]
+    elif key == "tab":
+        vs.focus = "results" if vs.focus == "now" else "now"
+    elif key == "enter" and cur:
+        vs.view, vs.detail_id, vs.scroll = "detail", cur, 0
+    elif key == "a":
+        vs.show_all = not vs.show_all
+    elif key == "f":
+        now_n = vs.feed_n if vs.feed_n is not None else feed_count(vs, vs.term_w)
+        i = FEED_CYCLE.index(now_n) if now_n in FEED_CYCLE else 0
+        vs.feed_n = FEED_CYCLE[(i + 1) % len(FEED_CYCLE)]
+    elif key == "e":
+        vs.only_err = not vs.only_err
+    elif key == "p":
+        vs.strip = not vs.strip
+    elif key == "r":
+        vs.view, vs.scroll = "results", 0
+    elif key == "R":
+        return "reload"
+    elif key == "t" and cur:
+        return "tail"
+    elif key == "T":
+        return "tails"
+    return None
+
+
+def diff_output(prev, lines, full=False):
+    """前フレームとの差分を端末出力文字列にする。全行同一なら空文字 (書かない)。"""
+    if prev is None or full or len(prev) != len(lines):
+        return "\x1b[H" + "\r\n".join(l + "\x1b[K" for l in lines) + "\x1b[J"
+    return "".join(f"\x1b[{i + 1};1H{b}\x1b[K" for i, (a, b) in enumerate(zip(prev, lines)) if a != b)
+
+
+def new_notifications(m, notified):
+    """遷移通知 [(key, title, body)]。notified (set) に積み、同一イベントは 1 回だけ。"""
+    out = []
+
+    def add(key, title, body):
+        if key not in notified:
+            notified.add(key)
+            out.append((key, title, body))
+    for r in m.rows:
+        if r["state"] == "error":
+            add(("error", r["id"]), "ultracode エラー", f"{r['label']} ({r['phase']})")
+        elif r["state"] == "stalled":
+            add(("stalled", r["id"]), "ultracode 停滞", f"{r['label']} ({r['phase']})")
+    if m.finished:
+        add(("done",), f"ultracode 完了 ✓{m.counts['done']} ✗{m.counts['error']}", m.name)
+    return out
+
+
+def status_text(m):
+    run = [p["name"] for p in m.phases if p["state"] == "running"]
+    cur = run[0] if run else ""
+    return f"▶{m.counts['running']} ✓{m.finished_n}/{m.seen} {cur}".strip()
+
+
+# ---------- IO: tail ペイン管理 ----------
+
+class TailPanes:
+    """agent id -> 自分が開いた tail pane id。二重起動を防ぎ、終了時に自分の pane だけ閉じる。"""
+
+    def __init__(self, run_dir):
+        self.run_dir, self.panes, self.extra = run_dir, {}, []
+
+    def _alive(self, pane_id):
+        try:
+            hcli("pane", "get", pane_id)
+            return True
+        except RuntimeError:
+            return False
+
+    def open(self, aid):
+        """-> "open" / "exists"。失敗は RuntimeError。"""
+        pid = self.panes.get(aid)
+        if pid and self._alive(pid):
+            return "exists"  # herdr に pane id 指定の focus が無いので通知のみ
+        pid = split_pane(os.environ.get("HERDR_PANE_ID"), "right")
+        try:
+            run_in_pane(pid, ["tail", aid, self.run_dir])
+        except RuntimeError:
+            close_panes([pid])
+            raise
+        self.panes[aid] = pid
+        return "open"
+
+    def close_all(self):
+        close_panes(list(self.panes.values()) + self.extra)
+        self.panes, self.extra = {}, []
+
+
+def bg(fn, *args):
+    """herdr 呼び出しを描画から切り離す。失敗は握りつぶす。"""
+    def run():
+        try:
+            fn(*args)
+        except Exception:  # noqa: BLE001 - 描画を止めない
+            pass
+    threading.Thread(target=run, daemon=True).start()
+
+
+def notify(title, body):
+    try:
+        hcli("notification", "show", title, "--body", body, "--sound", "done")
+    except RuntimeError:
+        pass
+
+
+# ---------- サブコマンド ----------
+
+def term_size(width_arg=None):
+    size = shutil.get_terminal_size((100, 30))
+    return (width_arg or size.columns), size.lines
+
+
+def dashboard_once(reader, args):
+    width, _ = term_size(args.width)
+    color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    m = reader.model(time.time())
+    vs = ViewState(show_all=args.all, results_cap=None if args.all else ONCE_RESULTS_CAP)
+    print("\n".join(render_frame(m, vs, width, 10 ** 6, 0, color)))
+    return 0
+
+
+def dashboard_live(reader, args):
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    out = sys.stdout
+    restored = []
+    tails = TailPanes(reader.run_dir)
+    rpipe, wpipe = os.pipe()
+    os.set_blocking(rpipe, False)
+    os.set_blocking(wpipe, False)
+
+    def restore():
+        if restored:
+            return
+        restored.append(1)
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+            out.write("\x1b[?25h\x1b[?1049l")
+            out.flush()
+        except (termios.error, OSError, ValueError):
+            pass
+        tails.close_all()
+
+    atexit.register(restore)
+    color = not os.environ.get("NO_COLOR")
+    vs = ViewState(interactive=True)
+    notified, stall_seen, stall_events = set(), set(), []
+    prev, prev_size, frame, next_tick, last_meta, idle_since, first = None, None, 0, 0.0, 0.0, None, True
+    action, want_reload = None, False
+    try:
+        tty.setcbreak(fd)
+        out.write("\x1b[?1049h\x1b[?25l")
+        if hasattr(signal, "SIGWINCH"):
+            def on_winch(*_):
+                try:
+                    os.write(wpipe, b"w")
+                except OSError:
+                    pass
+            signal.signal(signal.SIGWINCH, on_winch)
+        keys = []
+        while True:
+            now = time.time()
+            if now >= next_tick or want_reload:
+                reader.snapshot()
+                if want_reload:
+                    reader.workflow_meta(force=True)
+                next_tick, frame, want_reload = now + POLL_SEC, frame + 1, False
+            m = reader.build(now, stall_events)
+            fresh = [(now, r["id"]) for r in m.rows if r["state"] == "stalled" and r["id"] not in stall_seen]
+            stall_seen = {r["id"] for r in m.rows if r["state"] == "stalled"} | {i for _, i in fresh}
+            if fresh:
+                stall_events += fresh
+                m = reader.build(now, stall_events)
+            notes = new_notifications(m, notified)
+            if first:  # 起動時点で既にある状態は通知しない
+                first = False
+            else:
+                for _, title, body in notes:
+                    bg(notify, title, body)
+            if now - last_meta >= META_INTERVAL_SEC:
+                last_meta = now
+                bg(report_status, status_text(m), "✗ ultra" if m.has_alert else None)
+            for key in keys:
+                action = handle_key(vs, m, key)
+                if action == "quit":
+                    return 0
+                if action == "reload":
+                    want_reload, next_tick = True, 0.0
+                if action == "tail":
+                    ids = nav_ids(m, vs)
+                    aid = sel_id(vs, vs.focus, ids)
+                    try:
+                        vs.msg = "tail " + ("を開いた" if tails.open(aid) == "open" else "は既に開いている")
+                    except RuntimeError as e:
+                        vs.msg = f"tail 失敗: {e}"[:80]
+                    vs.msg_until = time.time() + 3
+                elif action == "tails":
+                    try:
+                        created = open_tails(reader.run_dir, 4)
+                        tails.extra += created
+                        vs.msg = "tail tab を開いた" if created else "実行中 agent なし"
+                    except RuntimeError as e:
+                        vs.msg = f"tails 失敗: {e}"[:80]
+                    vs.msg_until = time.time() + 3
+            keys = []
+            idle_since = next_idle_since(m.counts, idle_since, now)
+            if idle_expired(idle_since, now):
+                return 0
+            size = shutil.get_terminal_size((100, 30))
+            vs.term_w = size.columns
+            lines = render_frame(m, vs, size.columns, size.lines, frame, color)
+            chunk = diff_output(prev, lines, prev_size != size)
+            if chunk:
+                out.write(chunk)
+                out.flush()
+            prev, prev_size = lines, size
+            r, _, _ = select.select([fd, rpipe], [], [], max(0.0, next_tick - time.time()))
+            if rpipe in r:
+                try:
+                    os.read(rpipe, 64)
+                except OSError:
+                    pass
+                prev = None
+            if fd in r:
+                keys = parse_keys(os.read(fd, 64).decode("utf-8", "ignore"))
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        restore()
+
+
+def cmd_dashboard(args):
+    run_dir = resolve_run_dir(args.run)
+    if not run_dir:
+        print("run dir が見つからない", file=sys.stderr)
+        return 2
+    reader = RunReader(run_dir)
+    if args.once or not (sys.stdout.isatty() and sys.stdin.isatty()):
+        return dashboard_once(reader, args)
+    return dashboard_live(reader, args)
+
+
+def cmd_tail(args):
+    run_dir = resolve_run_dir(args.run)
+    if not run_dir:
+        print("run dir が見つからない", file=sys.stderr)
+        return 2
+    reader = RunReader(run_dir)
+    aid = resolve_agent(reader.journal(), args.agent)
+    if not aid:
+        print(f"agent を一意に特定できない: {args.agent}", file=sys.stderr)
+        return 2
+    path, first = os.path.join(run_dir, f"agent-{aid}.jsonl"), True
+    while True:
+        width = shutil.get_terminal_size((100, 30)).columns
+        lines = []
+        for raw in reader.new_lines(path):
+            try:
+                lines += format_event(json.loads(raw), width)
+            except ValueError:
+                continue
+        if first:
+            lines = lines[-args.lines:]
+        if lines:
+            print("\n".join(lines), flush=True)
+        first = False
+        if args.no_follow:
+            return 0
+        time.sleep(POLL_SEC)
+
+
+def open_dashboard(run_dir, pane=None, per_agent=0):
+    """dashboard を split ペインで開く。per_agent>0 なら実行中 agent の tail を新 tab に並べる。"""
+    new_pane = split_pane(pane or os.environ.get("HERDR_PANE_ID"), "right")
+    try:
+        run_in_pane(new_pane, ["dashboard", run_dir])
+    except RuntimeError:
+        close_panes([new_pane])
+        raise
+    if per_agent > 0 and not open_tails(run_dir, per_agent):
+        print("実行中 agent なし: tail ペインは開かない")
+
+
+def open_tails(run_dir, limit):
+    agents, stats = RunReader(run_dir).snapshot()
+    now = time.time()
+    running = [aid for aid, a in agents.items() if agent_state(a, stats.get(aid), now) == "running"][:limit]
+    if not running:
+        return []
+    ws = os.environ.get("HERDR_WORKSPACE_ID")
+    pane = find_key(hcli("tab", "create", "--label", f"ultra:{os.path.basename(run_dir)[-8:]}", "--no-focus",
+                         *(["--workspace", ws] if ws else [])), "pane_id")
+    if not pane:
+        raise RuntimeError("tab create の応答に pane_id が無い")
+    created = [pane]
+    try:
+        for i, aid in enumerate(running):
+            if i:
+                pane = split_pane(pane, "down" if i % 2 else "right")
+                created.append(pane)
+            run_in_pane(pane, ["tail", aid, run_dir])
+    except RuntimeError:
+        close_panes(created)
+        raise
+    return created
+
+
+def cmd_open(args):
+    run_dir = resolve_run_dir(args.run)
+    if not run_dir:
+        print("run dir が見つからない", file=sys.stderr)
+        return 2
+    if not in_herdr() and not args.pane:
+        print("herdr 内で実行するか --pane を指定する", file=sys.stderr)
+        return 2
+    open_dashboard(run_dir, args.pane, args.per_agent)
+    return 0
+
+
+def open_claimed(run_dir, pane=None):
+    """run を claim して dashboard を開く。再試行不要 (開けた / 他が claim 済み) なら True、失敗なら False。"""
+    run_id = os.path.basename(run_dir)
+    try:
+        if not claim_run(run_id):
+            return True
+    except OSError as e:
+        print(f"claim 失敗: {e}", file=sys.stderr)
+        return False
+    try:
+        open_dashboard(run_dir, pane)
+    except (RuntimeError, OSError, ValueError) as e:
+        release_run(run_id)
+        print(f"open 失敗: {e}", file=sys.stderr)
+        return False
+    return True
+
+
+def cmd_hook(args):
+    """PostToolUse(Workflow) 用: stdin の hook JSON から run を特定して open。失敗は黙って 0。"""
+    try:
+        run_dir = locate_from_hook(json.load(sys.stdin))
+        if run_dir and in_herdr():
+            open_claimed(run_dir)
+    except (ValueError, RuntimeError, OSError):
+        pass
+    return 0
+
+
+def handle_new_run(run_dir, print_only):
+    """新 run の dashboard を開く。再試行不要なら True、pane 未解決 / open 失敗なら False。"""
+    run_id, sid = os.path.basename(run_dir), session_id_of(run_dir)
+    pane = None
+    try:
+        pane = owner_pane(sid, hcli("agent", "list").get("agents", [])) if sid else None
+    except RuntimeError:
+        pass
+    print(f"new run {run_id} session={sid} pane={pane}", flush=True)
+    if print_only:
+        return True
+    return bool(pane) and open_claimed(run_dir, pane)
+
+
+def cmd_daemon(args):
+    known = set() if args.include_existing else set(find_run_dirs())
+    first_seen = {}  # 未完了 (再試行中) の run -> 初検出時刻
+    print(f"watching {projects_dir()} (Ctrl-C で終了)", flush=True)
+    while True:
+        now = time.time()
+        for run_dir in new_runs(known, find_run_dirs()):
+            first = first_seen.setdefault(run_dir, now)
+            if handle_new_run(run_dir, args.print_only) or retry_expired(first, now):
+                known.add(run_dir)
+                first_seen.pop(run_dir)
+        time.sleep(args.interval)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="herdr-ultra-watch", description="ultracode (Workflow) 実行の可視化")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def run_arg(sp):
+        sp.add_argument("run", nargs="?", help="run dir か run id。省略時は最新")
+        sp.add_argument("--latest", action="store_true", help="最新の run (省略時の既定動作)")
+
+    d = sub.add_parser("dashboard", help="phase/agent の進捗をライブ表示")
+    run_arg(d)
+    d.add_argument("--once", action="store_true", help="1 回描画して終了 (非 TTY も同じ)")
+    d.add_argument("--width", type=int, help="静的出力の幅 (既定: COLUMNS / 端末幅)")
+    d.add_argument("--all", action="store_true", help="静的出力で完了 agent を全件出す")
+    d.set_defaults(fn=cmd_dashboard)
+
+    t = sub.add_parser("tail", help="1 agent の transcript を追従表示")
+    t.add_argument("agent", help="agent id (前方一致) か label")
+    t.add_argument("run", nargs="?", help="run dir か run id。省略時は最新")
+    t.add_argument("--lines", type=int, default=20, help="最初に出す直近イベント数")
+    t.add_argument("--no-follow", action="store_true", help="既存分だけ出して終了")
+    t.set_defaults(fn=cmd_tail)
+
+    o = sub.add_parser("open", help="herdr ペインで dashboard を開く")
+    run_arg(o)
+    o.add_argument("--per-agent", type=int, default=0, metavar="N", help="実行中 agent の tail を新 tab に最大 N 個")
+    o.add_argument("--pane", help="split 元ペイン (既定: HERDR_PANE_ID / current)")
+    o.set_defaults(fn=cmd_open)
+
+    dm = sub.add_parser("daemon", help="新しい run を監視して dashboard を自動で開く (opt-in)")
+    dm.add_argument("--interval", type=float, default=5.0)
+    dm.add_argument("--print-only", action="store_true", help="開かず検出のみ表示")
+    dm.add_argument("--include-existing", action="store_true", help="起動時点の既存 run も対象にする")
+    dm.set_defaults(fn=cmd_daemon)
+
+    h = sub.add_parser("hook", help="PostToolUse(Workflow) hook JSON を stdin から受けて open")
+    h.set_defaults(fn=cmd_hook)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.fn(args)
+    except KeyboardInterrupt:
+        return 130
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

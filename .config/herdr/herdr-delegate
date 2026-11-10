@@ -1,0 +1,2568 @@
+#!/usr/bin/env python3
+"""herdr-delegate — Claude Code をブローカーにした herdr ペイン委任 CLI.
+
+サブコマンド: spawn / status / wait / collect / send / kill / reconcile(pending) / doctor
+            / health / diff / restore
+設計: dotfiles docs/2026-07-10-herdr-delegate-design.md
+
+終了コード (wait):
+  0 done / 1 failed / 2 blocked / 3 stalled(idle のまま result なし) / 4 pane gone
+  5 quiet(working だが進捗なし) / 6 timeout / 7 limited(枠切れ) / 8 preflight・設定エラー
+  gate_failed(--gate が --gate-retries 回失敗) は failed と同じ 1 (exit_reason=gate_failed)
+  protocol_violation(Stop hook の催促を使い切っても result なし) は failed と同じ 1
+複数 task の wait は JSON サマリを1回出力 (終了コードは全 done なら 0、他は最初の非 0)。
+"""
+
+import contextlib
+import datetime
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import random
+import re
+import shutil
+import signal
+import socket
+import string
+import subprocess
+import sys
+import tempfile
+import time
+
+SOCK = os.environ.get("HERDR_SOCKET_PATH") or os.path.expanduser("~/.config/herdr/herdr.sock")
+TASKS_DIR = os.environ.get("HERDR_DELEGATE_DIR") or os.path.expanduser(
+    "~/.config/herdr/delegate/tasks"
+)
+
+EXIT_DONE, EXIT_FAILED, EXIT_BLOCKED, EXIT_STALLED, EXIT_GONE = 0, 1, 2, 3, 4
+EXIT_QUIET = 5     # working だが進捗なし (--stall-secs/--stall-grace)
+EXIT_TIMEOUT = 6   # 旧: 3 (stalled と同コードだった)
+EXIT_LIMITED = 7   # CLI の利用枠切れ (pane 末尾の枠切れ表示を検出)
+EXIT_CONFIG = 8    # preflight / 設定 / herdr 到達不能
+
+
+# ---------- pure helpers ----------
+
+def slugify(text):
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return s[:20].rstrip("-") or "task"
+
+
+def new_task_id(slug, base_dir):
+    tid = f"dlg-{time.strftime('%H%M%S')}-{slug}"
+    while os.path.exists(os.path.join(base_dir, tid)):
+        suffix = "".join(random.choices(string.hexdigits.lower(), k=2))
+        tid = f"dlg-{time.strftime('%H%M%S')}-{slug}-{suffix}"
+    return tid
+
+
+EVIDENCE_HEADING = "## Verification evidence"
+CONTRACT_FIELDS = (("verify", "検証方法"), ("constraints", "制約"), ("stop_when", "停止条件"))
+
+
+def build_contract(verify, constraints, stop_when):
+    """--verify/--constraints/--stop-when → {key: text} (全て空なら None)."""
+    given = {"verify": verify, "constraints": constraints, "stop_when": stop_when}
+    contract = {k: v.strip() for k, v in given.items() if v and v.strip()}
+    return contract or None
+
+
+def contract_section(contract):
+    """契約フッターの「## Contract」節 (contract が無ければ "")."""
+    if not contract:
+        return ""
+    lines = [f"- {label}: {contract[key]}" for key, label in CONTRACT_FIELDS if key in contract]
+    return ("\n## Contract\n" + "\n".join(lines) + "\n"
+            f"result.md に「{EVIDENCE_HEADING}」節を書き、検証で実行したコマンドと出力要約を示すこと"
+            "(result.json なら verification_evidence キー)。無い完了報告は blocked 扱いになる。\n")
+
+
+def contract_footer(task_dir, schema=None, contract=None):
+    result = os.path.join(task_dir, "result.md")
+    footer = f"""
+--- 委任契約 ---
+完了したら {result} に以下の形式で書き込むこと:
+  status: done|failed
+  summary: 結果 3-10 行
+  artifacts: 変更ファイル/ブランチ/PR URL の列挙
+result.md を書くまでタスク完了とみなされない。
+質問・承認が必要なら result.md に status: blocked と理由を書いて停止。
+blocked のときは kind: ({"|".join(BLOCK_KINDS)}) と question: (質問本文) も書くこと。
+"""
+    footer += contract_section(contract)
+    if schema:
+        footer += f"""
+構造化結果: {os.path.join(task_dir, "result.json")} に JSON のみで書くこと (result.md の代わり)。
+  キー: status(done|failed|blocked), summary(string), artifacts(array of string), {describe_schema(schema)}
+"""
+    return footer
+
+
+RESULT_STATUSES = ("done", "failed", "blocked")
+BLOCK_KINDS = ("needs_input", "capability", "transient", "dependency")
+_RESULT_KEY_RE = re.compile(r"\s*(status|summary|artifacts|kind|question):\s*(.*)$", re.IGNORECASE)
+
+
+def describe_schema(schema):
+    """契約フッター用に --schema の必須キーと型を1行で説明する."""
+    props = schema.get("properties", {})
+    required = schema.get("required", [])
+    parts = [f"{k}({props.get(k, {}).get('type', 'any')})" for k in required]
+    return "必須: " + ", ".join(parts) if parts else "追加の必須キーなし"
+
+
+def md_status(text):
+    """result.md 本文の status 行 (done|failed|blocked)。無い/未知の値は None."""
+    for line in text.splitlines():
+        m = re.match(r"\s*status:\s*(\w+)", line, re.IGNORECASE)
+        if m and m.group(1).lower() in RESULT_STATUSES:
+            return m.group(1).lower()
+    return None
+
+
+def parse_result_md(text):
+    """result.md を {status, summary, artifacts, kind, question} に解釈する純関数.
+
+    `key:` 行から次の key 行までを値とする。artifacts は箇条書き/カンマ区切りを分解。
+    """
+    blocks, cur = {}, None
+    for line in text.splitlines():
+        m = _RESULT_KEY_RE.match(line)
+        if m:
+            cur = m.group(1).lower()
+            blocks[cur] = [m.group(2)]
+        elif cur:
+            blocks[cur].append(line)
+    flat = {k: "\n".join(v).strip() for k, v in blocks.items()}
+    return {
+        "status": md_status(text),
+        "summary": flat.get("summary", ""),
+        "artifacts": split_artifacts(flat.get("artifacts", "")),
+        "kind": flat.get("kind") or None,
+        "question": flat.get("question") or None,
+    }
+
+
+def split_artifacts(text):
+    items = []
+    for line in text.splitlines():
+        line = re.sub(r"^\s*[-*•]\s*", "", line).strip()
+        if line:
+            items.extend(x.strip() for x in line.split(",") if x.strip())
+    return items
+
+
+def normalize_kind(kind):
+    """blocked の kind。未記載・未知は needs_input."""
+    k = (kind or "").strip().lower()
+    return k if k in BLOCK_KINDS else "needs_input"
+
+
+def parse_result_json(text):
+    """result.json 本文 → dict。不正 JSON / status 不正は None."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("status") not in RESULT_STATUSES:
+        return None
+    return {
+        "status": data["status"],
+        "summary": str(data.get("summary", "")),
+        "artifacts": [str(a) for a in data.get("artifacts") or []],
+        "kind": data.get("kind"),
+        "question": data.get("question"),
+        "raw": data,
+    }
+
+
+def _read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def load_result(task_dir):
+    """worker の結果を {status, summary, artifacts, kind, question, source} で返す.
+
+    result.json (構造化) を優先し、無い/不正なら result.md。status が確定しなければ None。
+    """
+    text = _read_text(os.path.join(task_dir, "result.json"))
+    res = parse_result_json(text) if text is not None else None
+    if res:
+        res["source"] = "result.json"
+        return res
+    text = _read_text(os.path.join(task_dir, "result.md"))
+    res = parse_result_md(text) if text is not None else None
+    if res and res["status"]:
+        res["source"] = "result.md"
+        return res
+    return None
+
+
+def read_result_status(task_dir):
+    """結果の status (done|failed|blocked)。ファイル無し / status 行なし / 未知の値は None.
+
+    旧実装は status 行なしを done 扱いにして、書きかけ・古い result.md を
+    完了と誤認した。None なら decide() が NUDGE で status 行を促す。
+    """
+    res = load_result(task_dir)
+    return res["status"] if res else None
+
+
+JSON_TYPES = {"string": str, "integer": int, "number": (int, float), "boolean": bool,
+              "array": list, "object": dict, "null": type(None)}
+MAX_SCHEMA_ERRORS = 10
+
+
+def validate_result(data, schema):
+    """--schema (required + properties.type のみの簡易検証) に対するエラー文のリスト."""
+    if not isinstance(data, dict):
+        return ["result.json がオブジェクトでない"]
+    errors = [f"必須キー {k} がない" for k in schema.get("required", []) if k not in data]
+    for key, spec in schema.get("properties", {}).items():
+        want = JSON_TYPES.get(spec.get("type"))
+        if key in data and want and not _type_ok(data[key], spec["type"], want):
+            errors.append(f"{key} は {spec['type']} であること")
+    return errors[:MAX_SCHEMA_ERRORS]
+
+
+def _type_ok(value, name, want):
+    if isinstance(value, bool) and name in ("integer", "number"):
+        return False
+    return isinstance(value, want)
+
+
+def schema_errors(task_dir, schema):
+    """task の result.json を schema で検証 (result.json が無い/不正 JSON もエラー)."""
+    text = _read_text(os.path.join(task_dir, "result.json"))
+    try:
+        data = json.loads(text) if text is not None else None
+    except ValueError:
+        data = None
+    if data is None:
+        return ["result.json が存在しない/不正な JSON"]
+    return validate_result(data, schema)
+
+
+SCHEMA_SETTLE_SECS = 60
+
+
+def schema_gate_action(errors, corrected_at, result_mtime, now, settle=SCHEMA_SETTLE_SECS):
+    """スキーマ違反への対応: ok|correct(補正を1回送る)|wait(補正後の書き直し待ち)|invalid_final."""
+    if not errors:
+        return "ok"
+    if corrected_at is None:
+        return "correct"
+    if result_mtime is not None and result_mtime > corrected_at:
+        return "invalid_final"  # 補正後に書き直したがまだ違反
+    return "wait" if now - corrected_at < settle else "invalid_final"
+
+
+def looks_like_path(item):
+    """artifacts の要素がファイルパスらしいか (URL・ブランチ名・説明文は除外)."""
+    if "://" in item or re.search(r"\s", item):
+        return False
+    return item.startswith(("/", "./", "../", "~")) or bool(re.search(r"\.\w+$", item))
+
+
+def resolve_artifacts(items, base_dir, exists=os.path.exists):
+    """artifacts を絶対パス化し [{"raw","path","missing"}] を返す (パス以外はそのまま)."""
+    out = []
+    for raw in items:
+        if not looks_like_path(raw):
+            out.append({"raw": raw, "path": None, "missing": False})
+            continue
+        path = os.path.normpath(os.path.join(base_dir, os.path.expanduser(raw)))
+        out.append({"raw": raw, "path": path, "missing": not exists(path)})
+    return out
+
+
+def markdown_has_evidence(text):
+    """result.md に中身のある「## Verification evidence」節があるか."""
+    m = re.search(r"^#{1,6}\s*verification evidence\s*$(.*?)(?=^#{1,6}\s|\Z)",
+                  text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+    return bool(m and m.group(1).strip())
+
+
+def result_has_evidence(task_dir):
+    """完了報告に検証証跡があるか (result.json は verification_evidence キー)."""
+    res = load_result(task_dir)
+    if res and res["source"] == "result.json":
+        return bool(str(res["raw"].get("verification_evidence", "")).strip())
+    return markdown_has_evidence(_read_text(os.path.join(task_dir, "result.md")) or "")
+
+
+DEFAULT_GATE_TIMEOUT = 300
+DEFAULT_GATE_RETRIES = 3
+GATE_TAIL_BYTES = 3072
+GATE_TIMEOUT_RC = 124
+
+
+def tail_bytes(text, limit=GATE_TAIL_BYTES):
+    """text の末尾 limit バイト (UTF-8 の途中で切れた先頭文字は捨てる)."""
+    return text.encode("utf-8", "replace")[-limit:].decode("utf-8", "ignore")
+
+
+def gate_verdict(failures, retries):
+    """gate 失敗の累計回数 (今回を含む) から: retry(差し戻す) | exhausted(打ち切る)."""
+    return "retry" if failures < retries else "exhausted"
+
+
+def gate_feedback(cmd, rc, output, failures, retries):
+    """gate 失敗を worker に差し戻す1行メッセージ (出力末尾 3KB 付き)."""
+    reason = "タイムアウト" if rc == GATE_TIMEOUT_RC else f"終了コード {rc}"
+    return (f"決定論 gate が失敗 ({failures}/{retries}): `{cmd}` {reason}。"
+            f"出力末尾: {tail_bytes(output).strip()} "
+            "── 修正して gate を通してから result.md を書き直すこと。")
+
+
+def run_gate(cmd, cwd, timeout):
+    """gate コマンドを cwd で実行し (rc, 出力) を返す。タイムアウトは rc=124."""
+    proc = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, errors="replace",
+                            stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)  # shell の子孫 (サーバ等) も道連れにする
+        out, _ = proc.communicate()
+        return GATE_TIMEOUT_RC, (out or "") + f"\n[timeout {timeout}s]"
+    return proc.returncode, out
+
+
+def clamp_gate_timeout(timeout, deadline, now):
+    """gate の制限秒数を wait の残り時間 (deadline 無しなら無制限) で頭打ちにする。最低 1 秒."""
+    if deadline is None:
+        return timeout
+    return max(1, min(timeout, deadline - now))
+
+
+def first_gate_failure(gates, cwd, timeout, run=run_gate):
+    """gate を順に実行し、最初の失敗 (cmd, rc, output)。全成功は None."""
+    for cmd in gates:
+        rc, out = run(cmd, cwd, timeout)
+        if rc != 0:
+            return cmd, rc, out
+    return None
+
+
+RESULT_FILES = ("md", "json")
+
+
+def archive_result(task_dir):
+    """既存 result.md / result.json を result.<n>.* に退避し、退避先パスを返す (無ければ None).
+
+    再投入 (send) 後に古い result を完了と誤読しないため。戻り値は退避した最初のファイル。
+    """
+    present = [e for e in RESULT_FILES if os.path.exists(os.path.join(task_dir, f"result.{e}"))]
+    if not present:
+        return None
+    n = 1
+    while any(os.path.exists(os.path.join(task_dir, f"result.{n}.{e}")) for e in RESULT_FILES):
+        n += 1
+    for e in present:
+        os.replace(os.path.join(task_dir, f"result.{e}"),
+                   os.path.join(task_dir, f"result.{n}.{e}"))
+    return os.path.join(task_dir, f"result.{n}.{present[0]}")
+
+
+def restore_result(task_dir, archived):
+    """archive_result で退避した result を元に戻す (archived が None なら何もしない)."""
+    if not archived:
+        return
+    stem = archived.rsplit(".", 1)[0]
+    for e in RESULT_FILES:
+        if os.path.exists(f"{stem}.{e}"):
+            os.replace(f"{stem}.{e}", os.path.join(task_dir, f"result.{e}"))
+
+
+STALL_GRACE_SECS = 60        # 催促後も idle のまま result なし → STALLED
+NUDGE_INTERVAL_SECS = 20     # 催促の間隔 (2回目以降)
+MAX_NUDGES = 2
+DEFAULT_STALL_SECS = 600     # working なのに進捗なし → 1回通知
+DEFAULT_STALL_GRACE = 300    # 通知後さらに進捗なし → QUIET (exit 5)
+
+
+def decide(agent_status, result_status, nudges, idle_secs, timed_out=False,
+           quiet_secs=0, stall_secs=0, stall_grace=DEFAULT_STALL_GRACE,
+           already_notified=False, protocol_violation=False, limited=False):
+    """wait ループの1判定.
+
+    戻り値: CONTINUE|NUDGE|STALL_NOTIFY|DONE|FAILED_RESULT|BLOCKED|STALLED|QUIET
+            |PROTOCOL_VIOLATION|LIMITED|PANE_GONE|TIMEOUT
+    nudges は送信済みの催促回数 (bool も可)。quiet_secs は working 中に進捗が無い秒数、
+    stall_secs=0 で進捗監視を無効化。already_notified は STALL_NOTIFY 済みのラッチ。
+    limited は pane 末尾に枠切れ表示がある (idle/blocked で result なしのときだけ呼び出し側が立てる)。
+    timed_out は --timeout 超過。完了/失敗/blocked/pane 消失より弱く、
+    継続系 (CONTINUE/NUDGE/STALL_NOTIFY/QUIET) の場面でだけ TIMEOUT に置き換わる。
+    """
+    if agent_status == "working" and result_status != "blocked":
+        action = _decide_working(quiet_secs, stall_secs, stall_grace, already_notified)
+    else:
+        action = _decide_base(agent_status, result_status, nudges, idle_secs,
+                              protocol_violation, limited)
+    if timed_out and action in ("CONTINUE", "NUDGE", "STALL_NOTIFY", "QUIET"):
+        return "TIMEOUT"
+    return action
+
+
+def _decide_working(quiet_secs, stall_secs, stall_grace, already_notified):
+    if not stall_secs or quiet_secs < stall_secs:
+        return "CONTINUE"
+    if not already_notified:
+        return "STALL_NOTIFY"
+    return "QUIET" if quiet_secs >= stall_secs + stall_grace else "CONTINUE"
+
+
+def _decide_base(agent_status, result_status, nudges, idle_secs, protocol_violation,
+                 limited=False):
+    if agent_status is None:
+        return "PANE_GONE"
+    if limited and result_status is None:
+        return "LIMITED"
+    if result_status == "blocked" or agent_status == "blocked":
+        return "BLOCKED"
+    # idle / unknown
+    if result_status == "done":
+        return "DONE"
+    if result_status == "failed":
+        return "FAILED_RESULT"
+    if protocol_violation:
+        return "PROTOCOL_VIOLATION"
+    if nudges == 0 or (nudges < MAX_NUDGES and idle_secs > NUDGE_INTERVAL_SECS):
+        return "NUDGE"
+    if nudges >= MAX_NUDGES and idle_secs > STALL_GRACE_SECS:
+        return "STALLED"
+    return "CONTINUE"
+
+
+# decide() の終了アクション → (台帳 state, 終了コード)
+OUTCOMES = {
+    "DONE": ("done", EXIT_DONE),
+    "FAILED_RESULT": ("failed", EXIT_FAILED),
+    "BLOCKED": ("blocked", EXIT_BLOCKED),
+    "STALLED": ("stalled", EXIT_STALLED),
+    "QUIET": ("quiet", EXIT_QUIET),
+    "PROTOCOL_VIOLATION": ("protocol_violation", EXIT_FAILED),
+    "GATE_FAILED": ("failed", EXIT_FAILED),
+    "LIMITED": ("limited", EXIT_LIMITED),
+    "PANE_GONE": ("gone", EXIT_GONE),
+    "TIMEOUT": ("timeout", EXIT_TIMEOUT),
+}
+# OUTCOMES のうち state 名と異なる exit_reason を台帳に残すもの
+EXIT_REASONS = {"GATE_FAILED": "gate_failed"}
+# 旧 wait 出力の "status" 値との後方互換 (pane 消失は従来 "failed")
+PUBLIC_STATUS = {"gone": "failed", "protocol_violation": "failed"}
+# 台帳 state から終了コードを引く (複数 wait で終端済み task を観測せず報告するため)
+STATE_EXIT = {**{state: code for state, code in OUTCOMES.values()}, "killed": EXIT_GONE}
+
+
+# ---------- limit detection / CLI health ----------
+
+LIMIT_TAIL_LINES = 20
+LIMIT_FALLBACK_SECS = 1800  # reset 時刻を読めない枠切れの仮の退避時間
+AUTO_AGENTS = ("claude", "codex")  # --agent auto の優先順 (先頭が既定)
+# 枠切れ表示の検出パターン。誤検知を避けるため過去形・到達形に限る保守的な設定。
+# 注意: 実機の枠切れ画面の文言は未採取。下記は想定文言で、実機で差異が出たらここを直す。
+LIMIT_RES = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"you'?ve hit your\b.*\blimit",
+    r"\b(usage|rate|session|weekly|daily|5-hour) limit (has been )?(reached|exceeded|hit)\b",
+    r"\blimit reached\b",
+))
+LIMIT_WORD_RE = re.compile(r"\b(usage|rate) limit\b", re.IGNORECASE)
+RESET_HINT_RE = re.compile(r"\bresets?\b", re.IGNORECASE)
+RESET_AT_RE = re.compile(r"\bresets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)?", re.IGNORECASE)
+RESET_IN_RE = re.compile(r"\bresets?\s+in\s+(\d+)\s*(h|hour|m|min)", re.IGNORECASE)
+
+
+def parse_reset_epoch(text, now):
+    """枠切れ表示の復帰時刻 (epoch)。"resets at 3pm" / "resets at 15:30" (ローカル時刻) と
+    "resets in 2 hours" を解釈する。読めなければ None (曖昧な "resets at 3" も None)."""
+    m = RESET_IN_RE.search(text)
+    if m:
+        return now + int(m.group(1)) * (3600 if m.group(2).lower().startswith("h") else 60)
+    m = RESET_AT_RE.search(text)
+    if not m or not (m.group(2) or m.group(3)):
+        return None
+    hour, minute, ampm = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "").lower()
+    if ampm:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if ampm == "pm" else 0)
+    if hour > 23 or minute > 59:
+        return None
+    at = datetime.datetime.fromtimestamp(now).replace(hour=hour, minute=minute,
+                                                      second=0, microsecond=0)
+    if at.timestamp() <= now:
+        at += datetime.timedelta(days=1)
+    return at.timestamp()
+
+
+def detect_limit(tail, now):
+    """pane 末尾 (最後の LIMIT_TAIL_LINES 行) から枠切れを検出する純関数.
+
+    戻り値: {"reason": 該当行, "until": 復帰 epoch または None} / 枠切れでなければ None。
+    """
+    lines = tail.splitlines()[-LIMIT_TAIL_LINES:]
+    hit = next((ln for ln in lines if any(r.search(ln) for r in LIMIT_RES)), None)
+    if hit is None and RESET_HINT_RE.search("\n".join(lines)):
+        hit = next((ln for ln in lines if LIMIT_WORD_RE.search(ln)), None)
+    if hit is None:
+        return None
+    return {"reason": hit.strip()[:200], "until": parse_reset_epoch("\n".join(lines), now)}
+
+
+def active_limits(health, now):
+    """health.json の内容から期限内の {cli: {until, reason}} だけを返す (期限切れは自動復帰)."""
+    return {cli: e for cli, e in health.items()
+            if isinstance(e, dict) and e.get("until", 0) > now}
+
+
+def with_limit(health, cli, info, now):
+    """cli を枠切れとして記録した新しい health (until 不明は LIMIT_FALLBACK_SECS 後)."""
+    return {**active_limits(health, now),
+            cli: {"until": info["until"] or now + LIMIT_FALLBACK_SECS, "reason": info["reason"]}}
+
+
+def pick_agent(requested, health, now, order=AUTO_AGENTS, available=lambda cli: True):
+    """--agent の解決: (agent, fallback_from)。auto は枠切れでない最初の CLI (claude 既定).
+
+    候補が無ければ (None, None)。fallback_from は既定 CLI を避けたときだけその名前。
+    """
+    if requested != "auto":
+        return requested, None
+    limited = active_limits(health, now)
+    for cli in order:
+        if cli not in limited and available(cli):
+            return cli, (order[0] if cli != order[0] else None)
+    return None, None
+
+
+def health_path():
+    return os.path.join(os.path.dirname(TASKS_DIR), "health.json")
+
+
+def load_health():
+    try:
+        with open(health_path()) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_health(health):
+    os.makedirs(os.path.dirname(health_path()), exist_ok=True)
+    atomic_write_json(health_path(), health)
+
+
+def resolve_agent(requested):
+    """spawn の --agent を解決する。auto で全 CLI が枠切れなら ConfigError."""
+    agent, fallback_from = pick_agent(requested, load_health(), time.time(),
+                                      available=lambda cli: bool(shutil.which(cli)))
+    if agent is None:
+        raise ConfigError("--agent auto: 使える CLI が無い (全て枠切れか未インストール。"
+                          "herdr-delegate health で確認)")
+    return agent, fallback_from
+
+
+# ---------- ledger state machine ----------
+# state: running|done|failed|blocked|stalled|quiet|timeout|limited|gone|killed|protocol_violation
+# 終端 (不変): 作業の決着がついたもの。set_state(force=True) 以外では上書きしない。
+# 再開可能 (blocked/stalled/quiet/timeout/limited): worker が生きていて回復し得る。
+# running へ戻れる (resume) のは再開可能 state と、send による done/failed の再投入のみ。
+TERMINAL_STATES = frozenset({"done", "failed", "gone", "killed", "protocol_violation"})
+NO_REOPEN_STATES = frozenset({"gone", "killed"})  # pane が無いので force でも戻さない
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def effective_state(m):
+    """manifest の state。state キーの無い旧 manifest は killed_at から導く."""
+    return m.get("state") or ("killed" if m.get("killed_at") else "running")
+
+
+def apply_state(m, state, now, detail=None, exit_reason=None, force=False):
+    """manifest dict を state 遷移させる純関数。変化したら True."""
+    cur = effective_state(m)
+    if cur == state:
+        return False
+    if cur in NO_REOPEN_STATES or (cur in TERMINAL_STATES and not force):
+        return False
+    m["state"] = state
+    m.setdefault("events", []).append(
+        {"ts": now, "kind": "state", "state": state, "detail": detail})
+    if state == "running":  # resume: 前回の決着情報を消す
+        m["finished_at"] = m["exit_reason"] = m["delivered_at"] = None
+    else:
+        m["finished_at"] = now
+        m["exit_reason"] = exit_reason or state
+    return True
+
+
+def add_event(m, kind, detail, now):
+    m.setdefault("events", []).append({"ts": now, "kind": kind, "detail": detail})
+
+
+def needs_verification(m):
+    """done の確定に Watcher の検査 (schema/証跡/--gate) が要る task か。旧 manifest は不要扱い."""
+    return bool(m.get("gates") or m.get("schema") or m.get("contract"))
+
+
+def reconcile_state(state, result_status, pane, needs_gate=False):
+    """reconcile 用: 現 state と観測から新 state を返す (変化なしは None)。
+
+    result.md が failed、または done で検査不要 (needs_gate=False) かつ worker が
+    working でなければそれを採用。検査が要る done は Watcher の仕事なので採用しない。
+    pane が消えていて結果が確定していなければ gone。
+    """
+    if state in TERMINAL_STATES:
+        return None
+    pane_working = bool(pane) and pane.get("agent_status") == "working"
+    adoptable = result_status == "failed" or (result_status == "done" and not needs_gate)
+    if adoptable and not pane_working:
+        return result_status
+    if pane is None:
+        return "gone"
+    return None
+
+
+def format_reinject(rows, max_rows=10, max_line=200):
+    """status --active --format reinject 用の再注入テキスト (空なら "")."""
+    if not rows:
+        return ""
+    out = ["[Active delegated workers preserved across context compaction. "
+           "REFERENCE ONLY: 状態は wait/status で再確認すること。"
+           "done/failed/killed は含まない]"]
+    for r in rows[:max_rows]:
+        parts = [f"- {r['task_id']} {r['agent']} pane={r['pane_id']} state={r['state']}",
+                 f"cwd={r['cwd']}"]
+        if r.get("branch"):
+            parts.append(f"branch={r['branch']}")
+        parts.append(f"result.md={r['result_path']}")
+        line = " ".join(parts)
+        out.append(line if len(line) <= max_line else line[:max_line - 1] + "…")
+    if len(rows) > max_rows:
+        out.append(f"- …他 {len(rows) - max_rows} 件")
+    return "\n".join(out)
+
+
+def count_porcelain(text):
+    return len([ln for ln in (text or "").splitlines() if ln.strip()])
+
+
+IDEM_TTL_SECS = 24 * 3600
+
+
+def idem_dir():
+    return os.path.join(os.path.dirname(TASKS_DIR), "idem")
+
+
+def idem_path(key):
+    return os.path.join(idem_dir(), hashlib.sha256(key.encode()).hexdigest() + ".json")
+
+
+def prompt_sha(prompt_body):
+    return hashlib.sha256(prompt_body.encode()).hexdigest()
+
+
+def idem_verdict(record, sha):
+    """既存 idem レコードと今回 prompt の突き合わせ: existing|in_progress|conflict."""
+    if record.get("prompt_sha256") != sha:
+        return "conflict"
+    return "existing" if record.get("task_id") else "in_progress"
+
+
+def preflight_problems(agent, cwd, worktree=False, which=shutil.which, isdir=os.path.isdir,
+                       herdr_ok=None, is_git=None):
+    """spawn 前の環境チェック。問題の説明リスト (空なら OK).
+
+    herdr_ok/is_git は到達性・git 判定の注入口 (既定は実 herdr / 実 git)。
+    """
+    problems = []
+    for exe in ("herdr", agent):
+        if not which(exe):
+            problems.append(f"{exe} が PATH に無い")
+    if not isdir(cwd):
+        problems.append(f"cwd が存在しない: {cwd}")
+        return problems
+    if which("herdr") and not (herdr_ok or herdr_reachable)():
+        problems.append("herdr サーバに到達できない (herdr が起動していない?)")
+    if worktree and not (is_git or is_git_repo)(cwd):
+        problems.append(f"--worktree には git リポジトリが必要: {cwd}")
+    return problems
+
+
+# ---------- manifest I/O (atomic + lock) ----------
+
+def atomic_write_json(path, data):
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def save_manifest(task_dir, data):
+    atomic_write_json(os.path.join(task_dir, "manifest.json"), data)
+
+
+def load_manifest(task_dir):
+    with open(os.path.join(task_dir, "manifest.json")) as f:
+        return json.load(f)
+
+
+@contextlib.contextmanager
+def manifest_lock(task_dir):
+    """複数 orchestrator の read-modify-write 競合を避ける簡易 flock."""
+    with open(os.path.join(task_dir, ".lock"), "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
+
+
+def update_manifest(task_dir, mutate):
+    """ロック下で manifest を読み、mutate(m) の戻り値を返しつつ保存する."""
+    with manifest_lock(task_dir):
+        m = load_manifest(task_dir)
+        result = mutate(m)
+        save_manifest(task_dir, m)
+        return result
+
+
+PANE_SOURCE = "herdr-delegate"
+NO_PANE_REPORT_STATES = frozenset({"gone", "killed"})  # pane が無い/閉じる
+
+
+def metadata_args(pane_id, state, title=None):
+    """herdr pane report-metadata の引数 (UI のペイン枠に task state を出す)."""
+    args = ["pane", "report-metadata", pane_id, "--source", PANE_SOURCE,
+            "--custom-status", state]
+    return args + ["--title", title] if title else args
+
+
+def report_pane_state(pane_id, state, title=None):
+    """pane の custom-status/title に task state を反映する。表示だけなので失敗は無視."""
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        subprocess.run(["herdr", *metadata_args(pane_id, state, title)],
+                       capture_output=True, timeout=HCLI_TIMEOUT_SECS)
+
+
+def set_state(task_dir, state, detail=None, exit_reason=None, force=False):
+    shown = {}
+
+    def mutate(m):
+        shown.update(pane=m.get("pane_id"), title=m.get("label") or m.get("task_id"))
+        return apply_state(m, state, now_iso(), detail, exit_reason, force)
+    changed = update_manifest(task_dir, mutate)
+    if changed and shown["pane"] and state not in NO_PANE_REPORT_STATES:
+        report_pane_state(shown["pane"], state, shown["title"])
+    return changed
+
+
+def append_event(task_dir, kind, detail):
+    update_manifest(task_dir, lambda m: add_event(m, kind, detail, now_iso()))
+
+
+def mark_delivered(task_dir):
+    def mutate(m):
+        m["delivered_at"] = m.get("delivered_at") or now_iso()
+    update_manifest(task_dir, mutate)
+
+
+def transition(task_dir, state, detail=None, pane_alive=False, force=False, exit_reason=None):
+    """state 遷移を記録し、pane が生きていれば recovery.json も保存する."""
+    changed = set_state(task_dir, state, detail, exit_reason, force=force)
+    if changed and pane_alive:
+        save_recovery(task_dir, state)
+    return changed
+
+
+def resume_running(task_dir, detail):
+    """再開可能 state の task を running に戻す (既に running/終端なら何もしない)."""
+    m = load_manifest(task_dir)
+    if effective_state(m) not in TERMINAL_STATES:
+        set_state(task_dir, "running", detail)
+
+
+def gc_idem(now=None):
+    """24h 超の idem レコードを削除する."""
+    now = now or time.time()
+    try:
+        names = os.listdir(idem_dir())
+    except OSError:
+        return
+    for name in names:
+        p = os.path.join(idem_dir(), name)
+        try:
+            if now - os.path.getmtime(p) > IDEM_TTL_SECS:
+                os.unlink(p)
+        except OSError:
+            pass
+
+
+def claim_idem(key, sha, agent):
+    """idem キーを確保。("new", path) か ("existing"|"in_progress"|"conflict", record).
+
+    レコードは一時ファイルに書いてから os.link で原子的に配置する
+    (空/書きかけファイルを他 spawn に読ませない)。壊れた旧レコードは in_progress 扱い。
+    """
+    os.makedirs(idem_dir(), exist_ok=True)
+    path = idem_path(key)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    atomic_write_json(tmp, {"prompt_sha256": sha, "agent": agent,
+                            "created_at": now_iso(), "task_id": None})
+    try:
+        os.link(tmp, path)
+    except FileExistsError:
+        return _read_idem(path, sha)
+    finally:
+        release_idem(tmp)
+    return "new", path
+
+
+def _read_idem(path, sha):
+    try:
+        with open(path) as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return "in_progress", {}  # 空・壊れたレコード
+    return idem_verdict(record, sha), record
+
+
+def finish_idem(path, task_id):
+    with open(path) as f:
+        record = json.load(f)
+    record["task_id"] = task_id
+    atomic_write_json(path, record)
+
+
+def release_idem(path):
+    with contextlib.suppress(OSError):
+        os.unlink(path)
+
+
+# ---------- herdr I/O ----------
+
+CALL_TIMEOUT_SECS = 10
+HCLI_TIMEOUT_SECS = 30
+
+
+class ConfigError(Exception):
+    """preflight / 設定エラー (終了コード EXIT_CONFIG)."""
+
+
+class HerdrUnavailable(RuntimeError):
+    """herdr ソケット/CLI に到達できない (pane 消失とは区別する)."""
+
+
+def call(method, params):
+    req = json.dumps({"id": f"delegate:{method}", "method": method, "params": params}) + "\n"
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(CALL_TIMEOUT_SECS)
+            s.connect(SOCK)
+            s.sendall(req.encode())
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+    except OSError as e:  # timeout / 接続拒否 / ソケット無し
+        raise HerdrUnavailable(f"{method}: herdr ソケット {SOCK} に到達できない ({e})") from e
+    try:
+        resp = json.loads(buf)
+    except ValueError as e:
+        raise RuntimeError(f"{method}: 不正な応答 {buf[:200]!r}") from e
+    if "error" in resp:
+        raise RuntimeError(f"{method}: {resp['error']}")
+    return resp["result"]
+
+
+def hcli(*args):
+    try:
+        proc = subprocess.run(["herdr", *args], capture_output=True, text=True,
+                              timeout=HCLI_TIMEOUT_SECS)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise HerdrUnavailable(f"herdr {' '.join(args)}: 実行できない ({e})") from e
+    if proc.returncode != 0:
+        raise RuntimeError(f"herdr {' '.join(args)}: {proc.stderr.strip()}")
+    out = proc.stdout.strip()
+    if not out:
+        return {}
+    try:
+        return json.loads(out).get("result", {})
+    except ValueError as e:
+        raise RuntimeError(f"herdr {' '.join(args)}: JSON 以外の出力 {out[:200]!r}") from e
+
+
+def get_pane(pane_id):
+    """pane 情報。pane が無ければ None、herdr 到達不能なら HerdrUnavailable."""
+    try:
+        return call("pane.get", {"pane_id": pane_id})["pane"]
+    except HerdrUnavailable:
+        raise
+    except RuntimeError:
+        return None
+
+
+def current_workspace_id():
+    ws = os.environ.get("HERDR_WORKSPACE_ID")
+    if ws:
+        return ws
+    return hcli("pane", "current")["pane"]["workspace_id"]
+
+
+# ---------- git probes ----------
+
+GIT_TIMEOUT_SECS = 5
+
+
+def run_git(cwd, *args, env=None, timeout=GIT_TIMEOUT_SECS):
+    """git -C cwd args の stdout (失敗/タイムアウト/非 repo は None)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, *args], capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, timeout=timeout,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", **(env or {})})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def git_snapshot(cwd):
+    status = run_git(cwd, "status", "--porcelain")
+    return {
+        "branch": run_git(cwd, "rev-parse", "--abbrev-ref", "HEAD"),
+        "head": run_git(cwd, "rev-parse", "HEAD"),
+        "dirty": None if status is None else count_porcelain(status),
+    }
+
+
+def is_git_repo(cwd):
+    return run_git(cwd, "rev-parse", "--is-inside-work-tree") == "true"
+
+
+def herdr_reachable():
+    try:
+        hcli("workspace", "list")
+    except (HerdrUnavailable, RuntimeError):
+        return False
+    return True
+
+
+# ---------- progress detection (stall) ----------
+
+def claude_project_slug(cwd):
+    """claude の ~/.claude/projects/<slug> 名。英数字以外はすべて "-" (実測: / . _ など)."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+
+
+def epoch_iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(epoch))
+
+
+def iso_to_epoch(text):
+    """manifest の created_at (%Y-%m-%dT%H:%M:%S%z) → epoch。解釈不能は 0."""
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def newest_file(paths, since=0.0):
+    """mtime が since 以降で最新のファイルの (path, mtime_ns, size)。無ければ None."""
+    best = None
+    for p in paths:
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if st.st_mtime >= since and (best is None or st.st_mtime_ns > best[1]):
+            best = (p, st.st_mtime_ns, st.st_size)
+    return best
+
+
+def claude_transcript(cwd, since, home):
+    slugs = {claude_project_slug(cwd), claude_project_slug(os.path.realpath(cwd))}
+    paths = [p for sl in slugs
+             for p in glob.glob(os.path.join(home, ".claude", "projects", sl, "*.jsonl"))]
+    return newest_file(paths, since)
+
+
+def codex_session_cwd(path):
+    """rollout jsonl 先頭行 (session_meta) の cwd。読めなければ None."""
+    try:
+        with open(path) as f:
+            return json.loads(f.readline()).get("payload", {}).get("cwd")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def codex_day_dirs(since, today, home):
+    """spawn 日〜今日の ~/.codex/sessions/YYYY/MM/DD (ローカル日付) を列挙する."""
+    day = datetime.date.fromtimestamp(since)
+    last = datetime.date.fromtimestamp(today)
+    dirs = []
+    while day <= last:
+        dirs.append(os.path.join(home, ".codex", "sessions", f"{day:%Y/%m/%d}"))
+        day += datetime.timedelta(days=1)
+    return dirs
+
+
+def codex_transcript(cwd, since, home, now=None):
+    candidates = []
+    for d in codex_day_dirs(since, now or time.time(), home):
+        for p in glob.glob(os.path.join(d, "rollout-*.jsonl")):
+            found = newest_file([p], since)
+            if found:
+                candidates.append(found)
+    wanted = {cwd, os.path.realpath(cwd)}
+    for found in sorted(candidates, key=lambda f: -f[1]):
+        if codex_session_cwd(found[0]) in wanted:
+            return found
+    return None
+
+
+def progress_signature(m, home=None):
+    """worker の進捗シグネチャ文字列。transcript の mtime+size、無ければ git status の hash.
+
+    観測不能 (transcript も git も取れない) は None。
+    """
+    home = home or os.path.expanduser("~")
+    since = iso_to_epoch(m.get("created_at"))
+    finder = codex_transcript if m.get("agent") == "codex" else claude_transcript
+    found = finder(m["cwd"], since, home)
+    if found:
+        return f"transcript:{found[0]}:{found[1]}:{found[2]}"
+    status = run_git(m["cwd"], "status", "--porcelain")
+    return None if status is None else "git:" + hashlib.sha256(status.encode()).hexdigest()
+
+
+class ProgressWatch:
+    """進捗シグネチャの変化から「進捗なし秒数」を数える。観測失敗 (None) は状態を変えない."""
+
+    def __init__(self, now):
+        self.sig, self.last = None, now
+
+    def observe(self, sig, now):
+        """シグネチャを記録し、進捗があった (前回と異なる) なら True."""
+        if sig is None:
+            return False
+        progressed = self.sig is not None and sig != self.sig
+        self.sig = sig
+        if progressed:
+            self.last = now
+        return progressed
+
+    def quiet_secs(self, now):
+        return now - self.last
+
+    def reset(self, now):
+        self.sig, self.last = None, now
+
+
+# ---------- spawn ----------
+
+AGENT_CMDS = {
+    # {model}/{danger} はここで埋め込み済みの文字列。cwd/prompt はテンプレート外で
+    # wrapper スクリプトの $cwd / $prompt シェル変数として展開される
+    "claude": 'exec claude {model} {danger} {settings} "$prompt"',
+    "codex": 'exec codex {model} {danger} --cd "$cwd" "$prompt"',
+}
+DANGER_FLAGS = {
+    "claude": "--dangerously-skip-permissions",
+    "codex": "--dangerously-bypass-approvals-and-sandbox",
+}
+MODEL_FLAGS = {"claude": "--model {m}", "codex": "-m {m}"}
+
+
+STOP_HOOK = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                         "hooks", "herdr-delegate-stop.py")
+# worker の deny フロア: --dangerously-skip-permissions でも deny は先に評価される
+DENY_FLOOR = (
+    "Bash(git push --force*)",
+    "Bash(git push -f*)",
+    "Bash(rm -rf /)",
+    "Bash(rm -rf /*)",
+    "Bash(rm -rf ~*)",
+    "Bash(herdr pane close*)",
+    "Bash(herdr worktree remove*)",
+    "Bash(herdr server stop*)",
+)
+
+
+def build_worker_settings(hook_command, deny):
+    """claude --settings 用 dict: Stop hook (終了契約) と permissions.deny (フロア)."""
+    settings = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": hook_command}]}]}}
+    if deny:
+        settings["permissions"] = {"deny": list(deny)}
+    return settings
+
+
+def write_worker_settings(task_dir, deny):
+    import shlex
+
+    path = os.path.join(task_dir, "worker-settings.json")
+    atomic_write_json(path, build_worker_settings(f"python3 {shlex.quote(STOP_HOOK)}", deny))
+    return path
+
+
+def build_wrapper(task_dir, agent, model, safe, cwd, settings=None):
+    import shlex
+
+    prompt_path = os.path.join(task_dir, "prompt.md")
+    model_part = MODEL_FLAGS[agent].format(m=shlex.quote(model)) if model else ""
+    danger_part = "" if safe else DANGER_FLAGS[agent]
+    settings_part = f"--settings {shlex.quote(settings)}" if settings else ""
+    agent_cmd = AGENT_CMDS[agent].format(model=model_part, danger=danger_part,
+                                         settings=settings_part)
+    wrapper = tempfile.NamedTemporaryFile(
+        "w", delete=False, prefix="herdr-delegate-", suffix=".sh"
+    )
+    wrapper.write("#!/usr/bin/env bash\nset -euo pipefail\n")
+    wrapper.write(f"cwd={shlex.quote(cwd)}\n")
+    wrapper.write(f"export HERDR_DELEGATE_TASK_DIR={shlex.quote(task_dir)}\n")
+    wrapper.write(f"export HERDR_DELEGATE_RESULT={shlex.quote(os.path.join(task_dir, 'result.md'))}\n")
+    wrapper.write(f'prompt="$(cat {shlex.quote(prompt_path)})"\n')
+    wrapper.write('rm -f -- "$0"\n')
+    wrapper.write(f'cd "$cwd"\n{agent_cmd}\n')
+    wrapper.close()
+    os.chmod(wrapper.name, 0o755)
+    return wrapper.name
+
+
+def open_pane(args, task_id, cwd):
+    """worker 用 pane を作る。戻り値: pane 情報 dict (cwd は worktree なら worktree パス)."""
+    if args.worktree is not None:
+        branch = args.worktree or f"delegate/{task_id}"
+        wt = hcli("worktree", "create", "--cwd", cwd,
+                  "--branch", branch, "--json", "--no-focus")
+        # probe 実測 (2026-07-10, herdr 0.7.1): brief の想定キー
+        # (wt["path"] / wt["workspace_id"]) は存在しない。実際の応答は
+        # {"root_pane": {pane_id, tab_id, workspace_id, ...},
+        #  "tab": {...}, "workspace": {...},
+        #  "worktree": {branch, path, open_workspace_id, ...}} 形。
+        # root_pane に pane_id/tab_id/workspace_id が同梱されている点は
+        # tab create の root_pane fallback と同型なので pane.list は不要。
+        root = wt["root_pane"]
+        return {"pane_id": root["pane_id"], "tab_id": root["tab_id"],
+                "workspace_id": root["workspace_id"], "cwd": wt["worktree"]["path"],
+                "worktree_path": wt["worktree"]["path"], "worktree_branch": branch}
+    ws = current_workspace_id()
+    tab = hcli("tab", "create", "--workspace", ws, "--cwd", cwd,
+               "--label", task_id, "--no-focus")
+    # probe 実測 (2026-07-10, herdr 0.7.1): tab create の応答に
+    # root_pane が直接含まれる（pane_id/tab_id 込み）。pane.list による
+    # tab_id 一致検索は不要だが、将来のスキーマ変化に備え fallback を残す。
+    tab_id = tab["tab"]["tab_id"] if "tab" in tab else tab["tab_id"]
+    if "root_pane" in tab:
+        pane_id = tab["root_pane"]["pane_id"]
+    else:
+        panes = call("pane.list", {"workspace_id": ws})["panes"]
+        pane_id = next(p for p in panes if p["tab_id"] == tab_id)["pane_id"]
+    return {"pane_id": pane_id, "tab_id": tab_id, "workspace_id": ws, "cwd": cwd,
+            "worktree_path": None, "worktree_branch": None}
+
+
+def start_worker(args, task_dir, pane, settings=None):
+    wrapper = build_wrapper(task_dir, args.agent, args.model, args.safe, pane["cwd"], settings)
+    proc = subprocess.run(["herdr", "pane", "run", pane["pane_id"], f"bash {wrapper}"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        with contextlib.suppress(OSError):
+            os.unlink(wrapper)
+        raise RuntimeError(f"herdr pane run failed: {proc.stderr.strip()}")
+    call("pane.rename", {"pane_id": pane["pane_id"], "label": os.path.basename(task_dir)})
+
+
+def spawn_output(task_id, pane_id, task_dir, **extra):
+    return json.dumps({"task_id": task_id, "pane_id": pane_id,
+                       "task_dir": task_dir, **extra}, ensure_ascii=False)
+
+
+def idem_guard(args, prompt_body):
+    """--idempotency-key の処理。既存なら出力して None、新規なら idem パス、キー無しは ""."""
+    if not args.idempotency_key:
+        return ""
+    gc_idem()
+    verdict, info = claim_idem(args.idempotency_key, prompt_sha(prompt_body), args.agent)
+    if verdict == "new":
+        return info
+    if verdict == "conflict":
+        raise ConfigError(f"idempotency-key '{args.idempotency_key}' は別 prompt で使用済み")
+    if verdict == "in_progress":
+        raise ConfigError(f"idempotency-key '{args.idempotency_key}' の spawn が進行中/中断")
+    task_dir = task_dir_of(info["task_id"])
+    m = load_manifest(task_dir)
+    print(spawn_output(info["task_id"], m["pane_id"], task_dir,
+                       state=effective_state(m), existing=True))
+    return None
+
+
+def cmd_spawn(args):
+    prompt_body = args.prompt or open(args.prompt_file).read()
+    cwd = os.path.abspath(args.cwd or os.getcwd())
+    check_gate_args(args)
+    args.agent, args.fallback_from = resolve_agent(args.agent)
+    problems = preflight_problems(args.agent, cwd, worktree=args.worktree is not None)
+    if problems:
+        raise ConfigError("preflight 失敗: " + "; ".join(problems))
+    idem = idem_guard(args, prompt_body)
+    if idem is None:
+        return
+    try:
+        task_id = create_task(args, prompt_body, cwd)
+    except BaseException:
+        if idem:
+            release_idem(idem)
+        raise
+    if idem:
+        finish_idem(idem, task_id)
+
+
+def check_gate_args(args):
+    if args.gate_retries < 1 or args.gate_timeout < 1:
+        raise ConfigError("--gate-retries/--gate-timeout は 1 以上")
+
+
+def load_schema(path):
+    """--schema FILE を読む (未指定は None)。読めない/オブジェクトでないなら ConfigError."""
+    if not path:
+        return None
+    try:
+        with open(path) as f:
+            schema = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ConfigError(f"--schema を読めない: {path} ({e})") from e
+    if not isinstance(schema, dict):
+        raise ConfigError(f"--schema はオブジェクトであること: {path}")
+    return schema
+
+
+def count_active(manifests, group=None):
+    """未終端 task の数。group 指定ならその group のみ."""
+    return sum(1 for m in manifests
+               if effective_state(m) not in TERMINAL_STATES
+               and (group is None or m.get("group") == group))
+
+
+def check_concurrency(limit, group):
+    if limit is None:
+        return
+    active = count_active([m for _, _, m in iter_manifests()], group)
+    if active >= limit:
+        scope = f"group {group}" if group else "全体"
+        raise ConfigError(f"--max-concurrent {limit} 超過: {scope}で未終端 {active} 件")
+
+
+def parent_info(task_id):
+    """親 task の handoff 情報 (summary / branch / git diff --stat)."""
+    d = os.path.join(TASKS_DIR, task_id)
+    if not os.path.isfile(os.path.join(d, "manifest.json")):
+        raise ConfigError(f"--parent: 未知の task {task_id}")
+    m = load_manifest(d)
+    res = load_result(d)
+    base = m.get("base_commit")
+    return {
+        "task_id": task_id,
+        "summary": res["summary"] if res else "(result なし)",
+        "artifacts": res["artifacts"] if res else [],
+        "branch": m.get("worktree_branch"),
+        "diffstat": run_git(m["cwd"], "diff", "--stat", base) if base else None,
+    }
+
+
+def format_parent_section(parents):
+    """prompt 先頭に置く「## Parent task results」(空なら "")."""
+    if not parents:
+        return ""
+    out = ["## Parent task results"]
+    for p in parents:
+        out.append(f"### {p['task_id']}" + (f" (branch: {p['branch']})" if p["branch"] else ""))
+        out.append(p["summary"] or "(summary なし)")
+        if p["artifacts"]:
+            out.append("artifacts: " + ", ".join(p["artifacts"]))
+        if p["diffstat"]:
+            out.append("git diff --stat:\n" + p["diffstat"])
+    return "\n\n".join(out) + "\n\n---\n\n"
+
+
+def build_manifest(args, task_id, pane, settings, deny, schema, parent_ids, snapshot_pre=None):
+    now = now_iso()
+    return {
+        "task_id": task_id, "agent": args.agent, "model": args.model,
+        "pane_id": pane["pane_id"], "tab_id": pane["tab_id"],
+        "workspace_id": pane["workspace_id"], "cwd": pane["cwd"],
+        "worktree_path": pane["worktree_path"],
+        "worktree_branch": pane["worktree_branch"], "label": args.label,
+        "created_at": now, "safe": args.safe,
+        "group": args.group, "parents": parent_ids, "schema": bool(schema),
+        "worker_settings": settings, "deny_floor": deny,
+        "contract": build_contract(args.verify, args.constraints, args.stop_when),
+        "gates": list(args.gate or []), "gate_timeout": args.gate_timeout,
+        "gate_retries": args.gate_retries, "fallback_from": args.fallback_from,
+        "snapshot_pre": snapshot_pre,
+        "state": "running", "finished_at": None, "exit_reason": None,
+        "delivered_at": None, "base_commit": run_git(pane["cwd"], "rev-parse", "HEAD"),
+        "events": [{"ts": now, "kind": "state", "state": "running", "detail": "spawn"}],
+    }
+
+
+def rollback_spawn(pane, task_dir):
+    """spawn 失敗時に作った pane (worktree なら workspace ごと) と task dir を片付ける.
+
+    manifest が無いと doctor/kill から見えず孤児になるため。後始末の失敗は握りつぶす。
+    """
+    with contextlib.suppress(Exception):
+        if pane["worktree_path"]:
+            hcli("worktree", "remove", "--workspace", pane["workspace_id"], "--force")
+        else:
+            hcli("pane", "close", pane["pane_id"])
+    shutil.rmtree(task_dir, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def spawn_lock():
+    """並列 spawn の同時実行数チェックと task dir 確保を直列化する flock."""
+    os.makedirs(TASKS_DIR, exist_ok=True)
+    with open(TASKS_DIR.rstrip("/") + ".spawn.lock", "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
+
+
+def reserve_task(args, prompt_body, cwd):
+    """並列数を確認して task dir を作り、仮 manifest (pane 未確定) を置いて task_dir を返す.
+
+    仮 manifest を即置くので、並列 spawn が互いを未終端として数えられる。
+    """
+    with spawn_lock():
+        check_concurrency(args.max_concurrent, args.group)
+        task_id = new_task_id(slugify(args.label or prompt_body[:60]), TASKS_DIR)
+        task_dir = os.path.join(TASKS_DIR, task_id)
+        os.makedirs(task_dir)
+        now = now_iso()
+        save_manifest(task_dir, {
+            "task_id": task_id, "agent": args.agent, "group": args.group, "cwd": cwd,
+            "pane_id": None, "tab_id": None, "workspace_id": None, "worktree_path": None,
+            "worktree_branch": None, "created_at": now, "state": "running",
+            "events": [{"ts": now, "kind": "state", "state": "running", "detail": "reserve"}]})
+    return task_dir
+
+
+def create_task(args, prompt_body, cwd):
+    schema = load_schema(args.schema)
+    parent_ids = [x for x in (args.parent or "").split(",") if x]
+    parents = [parent_info(t) for t in parent_ids]
+
+    task_dir = reserve_task(args, prompt_body, cwd)
+    task_id = os.path.basename(task_dir)
+    try:
+        if schema:
+            atomic_write_json(os.path.join(task_dir, "schema.json"), schema)
+        with open(os.path.join(task_dir, "prompt.md"), "w") as f:
+            f.write(format_parent_section(parents) + prompt_body.rstrip() + "\n"
+                    + contract_footer(task_dir, schema,
+                                      build_contract(args.verify, args.constraints, args.stop_when)))
+        deny = [] if args.no_deny_floor or args.agent != "claude" else list(DENY_FLOOR)
+        settings = write_worker_settings(task_dir, deny) if args.agent == "claude" else None
+        pane = open_pane(args, task_id, cwd)
+    except BaseException:
+        shutil.rmtree(task_dir, ignore_errors=True)  # 仮 manifest が未終端として残らないように
+        raise
+    try:
+        pre = snapshot_pre(args, pane, task_id)
+        start_worker(args, task_dir, pane, settings)
+        with manifest_lock(task_dir):  # 並行する reconcile の書き戻しと競合させない
+            save_manifest(task_dir, build_manifest(args, task_id, pane, settings, deny,
+                                                   schema, parent_ids, pre))
+    except BaseException:
+        delete_snapshot_refs(pane["cwd"], task_id)
+        rollback_spawn(pane, task_dir)
+        raise
+    report_pane_state(pane["pane_id"], "running", args.label or task_id)
+    print(spawn_output(task_id, pane["pane_id"], task_dir))
+    return task_id
+
+
+POLL_SECS = 5
+WAIT_SLICE_MS = 10_000  # herdr 側ブロッキング待ちの1回あたり上限 (blocked 検知の遅延上限)
+NUDGE_TEXT = "委任契約を確認: 完了しているなら {result} に status/summary/artifacts を書くこと。"
+
+# 一回限りの trust-dialog 検出用: pane の可視テキストにこの部分文字列
+# (小文字比較) が含まれていたら、確認プロンプト待ちとみなし Return を1回送る。
+# 実測 (2026-07-10, claude CLI, herdr 0.7.1, 本 Task 3 のスモークテスト):
+# 実際の文言は以下 (フォルダ初回アクセス時の一回限りのダイアログ):
+#   "Quick safety check: Is this a project you created or one you trust?"
+#   "... take a moment to review what's in this folder first."
+#   "Claude Code'll be able to read, edit, and execute files here."
+#   選択肢: "1. Yes, I trust this folder" / "2. No, exit"
+# 事前情報 (Task 2 での目視) は agent_status が "unknown" になると想定して
+# いたが、本タスクの実測では herdr はこのダイアログ表示中も agent_status
+# を "idle" として報告した (working/blocked にはならない)。そのため検出
+# チェックは agent_status の値に関係なく毎ループ試みる (下記 cmd_wait 参照)。
+# "trust the files in this folder" は claude のバージョン差分に備えた保険。
+# "do you trust the contents of this directory" は Task 6 で実測した codex
+# 固有の初回ディレクトリ trust ダイアログの文言 (claude とは別文言)。
+TRUST_PROMPT_MARKERS = (
+    "is this a project you created or one you trust",
+    "trust this folder",
+    "trust the files in this folder",
+    "do you trust the contents of this directory",
+)
+
+
+def is_trust_prompt(text):
+    """pane の可視テキストが trust/confirm ダイアログらしいか判定する純関数."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in TRUST_PROMPT_MARKERS)
+
+
+def trust_cursor_on_no(text):
+    """trust ダイアログの選択カーソルが "No" 側にあるか判定する純関数。
+    新しい claude は初期カーソルが "No, exit" にあり、Return だけだと終了してしまう."""
+    return re.search(r"❯\s*(\d+\.\s*)?no\b", text.lower()) is not None
+
+
+def task_dir_of(task_id):
+    d = os.path.join(TASKS_DIR, task_id)
+    if not os.path.isdir(d):
+        raise SystemExit(f"unknown task: {task_id}")
+    return d
+
+
+def extract_read_text(out):
+    """`herdr agent read` の出力から本文を取り出す純関数 (JSON 封筒なら result.read.text、でなければそのまま)."""
+    try:
+        return json.loads(out)["result"]["read"]["text"]
+    except (ValueError, KeyError, TypeError):
+        return out
+
+
+def pane_tail(pane_id, lines=40):
+    proc = subprocess.run(
+        ["herdr", "agent", "read", pane_id, "--source", "recent-unwrapped",
+         "--lines", str(lines)],
+        capture_output=True, text=True)
+    return extract_read_text(proc.stdout)
+
+
+def save_recovery(task_dir, state):
+    """pane 消失に備えた復旧情報 (pane 末尾20行 + git 状態) を recovery.json に保存."""
+    m = load_manifest(task_dir)
+    atomic_write_json(os.path.join(task_dir, "recovery.json"), {
+        "saved_at": now_iso(), "state": state,
+        "pane_tail": pane_tail(m["pane_id"], 20).splitlines()[-20:],
+        "git": git_snapshot(m["cwd"]),
+    })
+
+
+def send_line(pane_id, text, retries=1):
+    # エコーバック検証窓: 狭い窓 (旧: --lines 5, デフォルト source) だと、
+    # haiku 等の速い agent の返信が数行入るだけでエコーが窓外に押し出され
+    # 偽陰性 → retry で同一テキストが二重送信される (実測 2026-07-10)。
+    # pane_tail() と同じ recent-unwrapped / lines=40 を使うことで、数行の
+    # 速い返信が入っても echo が窓内に残る可能性を大幅に上げる (理論上
+    # レースを消せるわけではないが、他の一発ワークアラウンド同様の許容
+    # レベルに合わせる)。
+    for _ in range(retries + 1):
+        subprocess.run(["herdr", "agent", "send", pane_id, text],
+                       capture_output=True, check=True)
+        time.sleep(0.3)
+        subprocess.run(["herdr", "pane", "send-keys", pane_id, "enter"],
+                       capture_output=True, check=True)
+        time.sleep(0.5)
+        if text[:20] in pane_tail(pane_id, lines=40):
+            return True
+    return False
+
+
+def nudge(pane_id, task_dir):
+    return send_line(pane_id, NUDGE_TEXT.format(
+        result=os.path.join(task_dir, "result.md")))
+
+
+def pane_visible(pane_id, lines=20):
+    proc = subprocess.run(
+        ["herdr", "agent", "read", pane_id, "--source", "visible",
+         "--lines", str(lines)],
+        capture_output=True, text=True)
+    return extract_read_text(proc.stdout)
+
+
+OBSERVE_RETRIES = 3
+
+
+def observe_pane(pane_id):
+    """get_pane を一時的な herdr 不達に対して数回リトライする。尽きたら終了コード 8."""
+    for attempt in range(OBSERVE_RETRIES):
+        try:
+            return get_pane(pane_id)
+        except HerdrUnavailable as e:
+            if attempt == OBSERVE_RETRIES - 1:
+                die(e, EXIT_CONFIG)
+            time.sleep(POLL_SECS)
+
+
+def die(msg, code):
+    print(f"herdr-delegate: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def wait_step(pane_id, status, deadline):
+    """次の観測までの待機。working 中は herdr のブロッキング待ち (idle 遷移で即復帰)、
+    それ以外・herdr 側待機が失敗した場合は POLL_SECS の sleep にフォールバック."""
+    if status == "working":
+        remaining = (deadline - time.time()) if deadline else WAIT_SLICE_MS / 1000
+        ms = int(max(1, min(WAIT_SLICE_MS, remaining * 1000)))
+        t0 = time.monotonic()
+        try:
+            proc = subprocess.run(
+                ["herdr", "wait", "agent-status", pane_id, "--status", "idle",
+                 "--timeout", str(ms)], capture_output=True, timeout=ms / 1000 + 5)
+        except (OSError, subprocess.TimeoutExpired):
+            proc = None
+        # rc=0 は idle 遷移、rc!=0 でもほぼ待ち切っていれば正常な timeout。
+        # 即失敗 (未対応/エラー) のときだけ sleep にフォールバックする。
+        if proc is not None and (proc.returncode == 0 or time.monotonic() - t0 >= ms / 1000 * 0.8):
+            return
+    time.sleep(POLL_SECS)
+
+
+TRUST_CURSOR_ATTEMPTS = 3
+
+
+def maybe_trust_dialog(pane_id):
+    """trust ダイアログが出ていれば「信頼する」を選んで Return を1回送り True.
+    カーソルが No 側なら Down を送って移動を再読込で確認してから Return する (入力取りこぼし対策)."""
+    visible = pane_visible(pane_id)
+    if not is_trust_prompt(visible):
+        return False
+    for _ in range(TRUST_CURSOR_ATTEMPTS):
+        if not trust_cursor_on_no(visible):
+            break
+        subprocess.run(["herdr", "pane", "send-keys", pane_id, "Down"], capture_output=True)
+        time.sleep(0.5)
+        visible = pane_visible(pane_id)
+    subprocess.run(["herdr", "pane", "send-keys", pane_id, "Return"], capture_output=True)
+    return True
+
+
+def notify(title, body):
+    subprocess.run(["herdr", "notification", "show", title, "--body", body],
+                   capture_output=True)
+
+
+def result_summary(task_dir, m):
+    """結果の summary / artifacts (絶対パス化) / kind を dict で返す (結果なしは空)."""
+    res = load_result(task_dir)
+    if not res:
+        return {}
+    out = {"summary": res["summary"],
+           "artifacts": [a["path"] or a["raw"]
+                         for a in resolve_artifacts(res["artifacts"], m.get("cwd") or task_dir)]}
+    if res["status"] == "blocked":
+        out["kind"] = normalize_kind(res["kind"])
+        if res["question"]:
+            out["question"] = res["question"]
+    return out
+
+
+def record_outcome(w, action):
+    """終了アクションを台帳に記録し、出力 dict と終了コードを返す (stderr に pane 末尾も出す)."""
+    state, code = OUTCOMES[action]
+    task_dir, status = w.task_dir, w.status
+    info = result_summary(task_dir, w.manifest)
+    detail = f"wait: agent_status={status}"
+    if "kind" in info:
+        detail += f" kind={info['kind']}"
+    elif action == "BLOCKED":
+        info["kind"] = normalize_kind(None)
+        if w.forced_block:
+            info["question"] = w.forced_block
+    transition(task_dir, state, detail=detail, pane_alive=action != "PANE_GONE",
+               exit_reason=EXIT_REASONS.get(action))
+    snapshot_post(task_dir)
+    out = {"task_id": w.task_id, "status": PUBLIC_STATUS.get(state, state), "state": state}
+    if action in ("DONE", "FAILED_RESULT", "GATE_FAILED"):
+        res = load_result(task_dir)
+        out["result"] = os.path.join(task_dir, res["source"] if res else "result.md")
+    elif action == "PANE_GONE":
+        out["reason"] = "pane gone"
+    elif action in ("TIMEOUT", "QUIET"):
+        out["agent_status"] = status
+    elif action == "PROTOCOL_VIOLATION":
+        out["reason"] = "Stop hook の催促を使い切っても result の status 行なし"
+    if action == "GATE_FAILED":
+        out.update(reason="gate_failed", gate=w.gate_failure)
+        notify(f"delegate {w.task_id} gate 失敗", f"gate が {w.gate_failure['retries']} 回失敗: "
+               f"{w.gate_failure['cmd']}")
+    elif action == "LIMITED":
+        health = with_limit(load_health(), w.manifest["agent"], w.limit_info, time.time())
+        save_health(health)
+        out.update(reason=w.limit_info["reason"],
+                   until=epoch_iso(health[w.manifest["agent"]]["until"]))
+        notify(f"delegate {w.task_id} 枠切れ", f"{w.manifest['agent']}: {w.limit_info['reason']}")
+    if action == "BLOCKED":
+        out.update({k: info[k] for k in ("kind", "question") if k in info})
+        notify(f"delegate {w.task_id} blocked", "サブエージェントが入力待ち")
+    if action in ("BLOCKED", "STALLED", "TIMEOUT", "QUIET", "PROTOCOL_VIOLATION", "LIMITED"):
+        print(pane_tail(w.pane_id), file=sys.stderr)
+    return out, code
+
+
+class Watcher:
+    """1 task の wait 状態 (催促回数・idle 開始・進捗監視)。tick() が1回観測して判定を返す."""
+
+    def __init__(self, task_id, args):
+        self.task_id = task_id
+        self.task_dir = task_dir_of(task_id)
+        self.manifest = load_manifest(self.task_dir)
+        self.pane_id = self.manifest["pane_id"]
+        self.stall_secs, self.stall_grace = args.stall_secs, args.stall_grace
+        self.deadline = time.time() + args.timeout / 1000 if args.timeout else None
+        self.notified = bool(self.manifest.get("stall_notified_at"))
+        self.nudges = 0
+        self.idle_since = None
+        self.trust_tried = False
+        self.progress = ProgressWatch(time.time())
+        self.status = None
+        self.forced_block = None   # 契約違反で DONE を BLOCKED に読み替えた理由
+        self.gate_failure = None   # gate 打ち切り時の {cmd, rc, tail, retries}
+        self.limit_info = None     # 枠切れ検出時の {reason, until}
+        resume_running(self.task_dir, "wait 開始")
+
+    def tick(self):
+        """観測 → decide()。戻り値は decide() のアクション (NUDGE/STALL_NOTIFY は処理済み)."""
+        pane = observe_pane(self.pane_id)
+        self.status = pane.get("agent_status") if pane else None
+        # 一回限りの trust-dialog ワークアラウンド: claude の「このフォルダを信頼しますか」
+        # ダイアログ表示中は nudge/stall ロジックが無力 (テキスト送信では進まない)。
+        # 実測 (herdr 0.7.1) ではダイアログ中も agent_status は "idle" なので、status では
+        # 判別せず毎回 pane の可視テキストを見る。一度 Return を送ったら再送しない。
+        # このループは decide() を通さず status=None (次の待機は POLL_SECS の sleep) にする。
+        if pane is not None and not self.trust_tried and maybe_trust_dialog(self.pane_id):
+            self.trust_tried = True
+            self.status = None
+            return "CONTINUE"
+        now = time.time()
+        self.idle_since = (self.idle_since or now) if self.status == "idle" else None
+        idle_secs = now - self.idle_since if self.idle_since else 0
+        result_status = read_result_status(self.task_dir)
+        action = decide(
+            self.status, result_status, self.nudges, idle_secs,
+            timed_out=bool(self.deadline and now > self.deadline),
+            quiet_secs=self._quiet_secs(now), stall_secs=self.stall_secs,
+            stall_grace=self.stall_grace, already_notified=self.notified,
+            protocol_violation=os.path.exists(os.path.join(self.task_dir, "protocol_violation")),
+            limited=self._limited(result_status))
+        return self._apply(action)
+
+    def _limited(self, result_status):
+        """idle/blocked で result なしのとき pane 末尾に枠切れ表示があるか (検出内容は limit_info)."""
+        if self.status not in ("idle", "blocked") or result_status is not None:
+            return False
+        self.limit_info = detect_limit(pane_tail(self.pane_id, LIMIT_TAIL_LINES), time.time())
+        return self.limit_info is not None
+
+    def _quiet_secs(self, now):
+        if self.status != "working" or not self.stall_secs:
+            self.progress.reset(now)
+            return 0
+        if self.progress.observe(progress_signature(self.manifest), now) and self.notified:
+            self.notified = False
+            update_manifest(self.task_dir, lambda m: m.update(stall_notified_at=None))
+        return self.progress.quiet_secs(now)
+
+    def _apply(self, action):
+        if action == "NUDGE":
+            nudge(self.pane_id, self.task_dir)
+            self.nudges += 1
+            self.idle_since = None
+        elif action == "STALL_NOTIFY":
+            self._notify_stall()
+        elif action == "DONE":
+            return self._done_gates()
+        return action
+
+    def _done_gates(self):
+        """DONE 時の検査を順に: --schema → 契約の証跡 → --gate コマンド."""
+        if self.manifest.get("schema") and self._schema_gate() != "DONE":
+            return "CONTINUE"
+        if self.manifest.get("contract") and not result_has_evidence(self.task_dir):
+            self.forced_block = f"result に「{EVIDENCE_HEADING}」節が無い (verify の実行証跡を書くこと)"
+            return "BLOCKED"
+        return self._command_gates()
+
+    def _command_gates(self):
+        """--gate を cwd で実行。失敗は tail を worker に差し戻し、retries 超過で GATE_FAILED."""
+        gates = self.manifest.get("gates") or []
+        retries = self.manifest.get("gate_retries") or DEFAULT_GATE_RETRIES
+        timeout = clamp_gate_timeout(self.manifest.get("gate_timeout") or DEFAULT_GATE_TIMEOUT,
+                                     self.deadline, time.time())
+        failure = first_gate_failure(gates, self.manifest["cwd"], timeout)
+        if failure is None:
+            return "DONE"
+        cmd, rc, output = failure
+        failures = bump_gate_failures(self.task_dir)
+        append_event(self.task_dir, "gate", f"失敗 {failures}/{retries}: {cmd} rc={rc}")
+        if gate_verdict(failures, retries) == "exhausted":
+            self.gate_failure = {"cmd": cmd, "rc": rc, "tail": tail_bytes(output), "retries": retries}
+            return "GATE_FAILED"
+        resend(self.task_dir, self.pane_id, gate_feedback(cmd, rc, output, failures, retries))
+        self.nudges, self.idle_since = 0, None
+        return "CONTINUE"
+
+    def _notify_stall(self):
+        self.notified = True
+        update_manifest(self.task_dir, lambda m: (
+            m.update(stall_notified_at=now_iso()),
+            add_event(m, "stall", f"進捗なし {self.stall_secs}s", now_iso())))
+        notify(f"delegate {self.task_id} 進捗なし",
+               f"working だが {self.stall_secs}s 進捗なし (あと {self.stall_grace}s で quiet 終了)")
+
+    def _schema_gate(self):
+        """DONE 時の --schema 検証。違反なら補正を1回送り、再違反は警告つきで done 扱い."""
+        with open(os.path.join(self.task_dir, "schema.json")) as f:
+            errors = schema_errors(self.task_dir, json.load(f))
+        m = load_manifest(self.task_dir)
+        try:
+            mtime = os.path.getmtime(os.path.join(self.task_dir, "result.json"))
+        except OSError:
+            mtime = None
+        act = schema_gate_action(errors, m.get("schema_corrected_at"), mtime, time.time())
+        if act == "correct":
+            send_line(self.pane_id, f"result.json がスキーマ違反: {'; '.join(errors)}。"
+                      f"{self.task_dir}/result.json を修正して書き直すこと。")
+            update_manifest(self.task_dir, lambda man: man.update(schema_corrected_at=time.time()))
+            self.idle_since = None
+            return "CONTINUE"
+        if act == "wait":
+            return "CONTINUE"
+        update_manifest(self.task_dir, lambda man: man.update(
+            schema_valid=act == "ok", schema_errors=errors))
+        if act == "invalid_final":
+            print(f"herdr-delegate: WARN schema 違反のまま完了: {'; '.join(errors)}",
+                  file=sys.stderr)
+        return "DONE"
+
+
+def bump_gate_failures(task_dir):
+    """gate 失敗の累計回数を台帳に加算して返す."""
+    def mutate(m):
+        m["gate_failures"] = m.get("gate_failures", 0) + 1
+        return m["gate_failures"]
+    return update_manifest(task_dir, mutate)
+
+
+def wait_single(args, task_id):
+    """1 task を待ち、JSON 1行を出して終了コードで exit する (従来の出力形式)."""
+    d = task_dir_of(task_id)
+    m = load_manifest(d)
+    if effective_state(m) in TERMINAL_STATES:  # 終端済みは観測せず台帳から報告 (wait_many と同じ)
+        out = ledger_result(task_id, m, d)
+        print(json.dumps(out))
+        sys.exit(out["exit_code"])
+    w = Watcher(task_id, args)
+    while True:
+        action = w.tick()
+        if action in OUTCOMES:
+            out, code = record_outcome(w, action)
+            print(json.dumps(out))
+            sys.exit(code)
+        wait_step(w.pane_id, w.status, w.deadline)
+
+
+def ledger_result(task_id, m, d):
+    """終端済み task は観測せず台帳の state から報告する."""
+    state = effective_state(m)
+    return {"task_id": task_id, "exit_code": STATE_EXIT.get(state, EXIT_FAILED),
+            "status": PUBLIC_STATUS.get(state, state), "state": state,
+            **result_summary(d, m)}
+
+
+def wait_many(args, task_ids):
+    """複数 task を単一プロセスで待ち、全 task (--any なら最初の1つ) の終端後に JSON サマリを出す."""
+    results, watchers = {}, {}
+    for tid in task_ids:
+        d = task_dir_of(tid)
+        m = load_manifest(d)
+        if effective_state(m) in TERMINAL_STATES:
+            results[tid] = ledger_result(tid, m, d)
+    for tid in task_ids:
+        if tid not in results and not (args.any and results):
+            watchers[tid] = Watcher(tid, args)
+    while watchers and not (args.any and results):
+        for tid, w in list(watchers.items()):
+            action = w.tick()
+            if action not in OUTCOMES:
+                continue
+            out, code = record_outcome(w, action)
+            results[tid] = {**out, "exit_code": code, **result_summary(w.task_dir, w.manifest)}
+            del watchers[tid]
+            if action == "BLOCKED":  # 即時に気付けるよう 1 行だけ先に出す
+                print(json.dumps({"event": "blocked", **{k: out[k] for k in out if k != "status"}},
+                                 ensure_ascii=False), file=sys.stderr)
+        if watchers and not (args.any and results):
+            time.sleep(POLL_SECS)
+    ordered = [results[t] for t in task_ids if t in results]
+    print(json.dumps({"results": ordered, "pending": list(watchers)}, ensure_ascii=False))
+    sys.exit(first_nonzero_exit(ordered))
+
+
+def first_nonzero_exit(results):
+    """全 done なら 0、それ以外は最初の非 0 の終了コード."""
+    return next((r["exit_code"] for r in results if r["exit_code"]), 0)
+
+
+def group_task_ids(group):
+    return [tid for tid, _, m in iter_manifests() if m.get("group") == group]
+
+
+def cmd_wait(args):
+    ids = list(dict.fromkeys(args.task_ids + (group_task_ids(args.group) if args.group else [])))
+    if not ids:
+        die("wait: task id か --group (該当 task あり) を指定すること", EXIT_CONFIG)
+    if len(ids) == 1 and not args.group:
+        wait_single(args, ids[0])
+    else:
+        wait_many(args, ids)
+
+
+def result_text(task_dir):
+    """collect で表示する本文。result.md 優先、無ければ result.json を整形 (どちらも無ければ None)."""
+    text = _read_text(os.path.join(task_dir, "result.md"))
+    if text is not None:
+        return text
+    res = load_result(task_dir)
+    return json.dumps(res["raw"], ensure_ascii=False, indent=2) if res else None
+
+
+def report_artifacts(task_dir, m):
+    """artifacts を絶対パスで列挙し、存在しないパスは WARN と manifest(artifacts_missing) に残す."""
+    res = load_result(task_dir)
+    if not res or not res["artifacts"]:
+        return
+    resolved = resolve_artifacts(res["artifacts"], m.get("cwd") or task_dir)
+    print("--- artifacts (絶対パス) ---")
+    for a in resolved:
+        print(a["path"] or a["raw"])
+        if a["missing"]:
+            print(f"herdr-delegate: WARN artifact が存在しない: {a['path']}", file=sys.stderr)
+    missing = [a["path"] for a in resolved if a["missing"]]
+    update_manifest(task_dir, lambda man: man.update(artifacts_missing=missing))
+
+
+def cmd_collect(args):
+    task_dir = task_dir_of(args.task_id)
+    manifest = load_manifest(task_dir)
+    text = result_text(task_dir)
+    if text is not None:
+        print(text)
+        report_artifacts(task_dir, manifest)
+        record_collected(task_dir)
+        return
+    append_event(task_dir, "collect", "result なし (pane 末尾で代替)")
+    print("# result なし — pane 末尾で代替:", file=sys.stderr)
+    print(pane_tail(manifest["pane_id"], 60))
+    sys.exit(EXIT_STALLED)
+
+
+def record_collected(task_dir):
+    """collect で result を渡した事実と、result の status を台帳へ反映する."""
+    status = read_result_status(task_dir)
+    if status in RESULT_STATUSES:
+        transition(task_dir, status, detail="collect", pane_alive=False)
+        snapshot_post(task_dir)
+        mark_delivered(task_dir)  # 未確定 (status 行なし) の result は配信済みにしない
+
+
+ROUND_FILES = ("protocol_violation", "stop_nudges")
+ROUND_MANIFEST_KEYS = ("schema_corrected_at", "schema_valid", "schema_errors", "stall_notified_at")
+
+
+def reset_round_state(task_dir):
+    """send による再投入で、前ラウンドの終了契約強制状態 (催促回数・違反印・補正履歴) を消す."""
+    for name in ROUND_FILES:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(os.path.join(task_dir, name))
+
+    def mutate(m):
+        for k in ROUND_MANIFEST_KEYS:
+            m.pop(k, None)
+    update_manifest(task_dir, mutate)
+
+
+def resend(task_dir, pane_id, text):
+    """古い result を退避して text を worker に送り、running に戻す。送れなければ result を戻し False."""
+    archived = archive_result(task_dir)  # 古い result を完了と誤読させない
+    try:
+        sent = send_line(pane_id, text)
+    except BaseException:
+        restore_result(task_dir, archived)  # herdr 側失敗でも result.md を戻す
+        raise
+    if not sent:
+        restore_result(task_dir, archived)
+        return False
+    append_event(task_dir, "send", text[:200])
+    reset_round_state(task_dir)
+    transition(task_dir, "running", detail="send で再投入", force=True)
+    return True
+
+
+def cmd_send(args):
+    task_dir = task_dir_of(args.task_id)
+    manifest = load_manifest(task_dir)
+    if observe_pane(manifest["pane_id"]) is None:
+        die(f"send: pane が無い ({manifest['pane_id']})", EXIT_GONE)
+    if not resend(task_dir, manifest["pane_id"], args.text):
+        raise SystemExit("send: エコーバック検証に失敗 (2回試行)")
+    # 人手の再投入は gate 試行回数をやり直す (gate 自動差し戻しの resend では保持する)
+    update_manifest(task_dir, lambda m: m.pop("gate_failures", None))
+
+
+def task_ids_newest_first():
+    if not os.path.isdir(TASKS_DIR):
+        return []
+    return sorted(os.listdir(TASKS_DIR),
+                  key=lambda t: os.path.getmtime(os.path.join(TASKS_DIR, t)),
+                  reverse=True)
+
+
+def iter_manifests(ids=None):
+    for tid in ids if ids is not None else task_ids_newest_first():
+        d = os.path.join(TASKS_DIR, tid)
+        if os.path.isfile(os.path.join(d, "manifest.json")):
+            yield tid, d, load_manifest(d)
+
+
+def cmd_status(args):
+    gc_idem()
+    ids = [args.task_id] if args.task_id else None
+    fmt = "json" if args.json else args.format
+    if fmt == "reinject":
+        rows = [{"task_id": tid, "agent": m["agent"], "pane_id": m["pane_id"],
+                 "state": effective_state(m), "cwd": m["cwd"],
+                 "branch": m.get("worktree_branch"),
+                 "result_path": os.path.join(d, "result.md")}
+                for tid, d, m in iter_manifests(ids)
+                if args.active and effective_state(m) not in TERMINAL_STATES]
+        text = format_reinject(rows)
+        if text:
+            print(text)
+        return
+    rows = []
+    for tid, d, m in iter_manifests(ids):
+        state = effective_state(m)
+        if args.active and state in TERMINAL_STATES:
+            continue
+        pane = get_pane(m["pane_id"])
+        rows.append({
+            "task_id": tid,
+            "agent": m["agent"],
+            "model": m.get("model"),
+            "state": state,
+            "pane": m["pane_id"] if pane else "GONE",
+            "agent_status": pane.get("agent_status") if pane else None,
+            "result": read_result_status(d),
+            "cwd": m["cwd"],
+        })
+    if fmt == "json":
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+    elif not rows:
+        print("(no tasks)")
+    else:
+        for r in rows:
+            print(f"{r['task_id']:34} {r['agent']:6} {str(r['agent_status']):8} "
+                  f"state={r['state']} result={r['result']} pane={r['pane']}")
+
+
+SAFE_GIT = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+GIT_PROBE_ENV = {"GIT_TERMINAL_PROMPT": "0"}
+ARCHIVE_REF = "refs/herdr/archive/{}"
+
+
+def probe_worktree(path, base):
+    """worktree の成果有無: {"commits": base..HEAD の件数, "dirty": porcelain 件数}。取れなければ None.
+
+    base が無い旧 manifest は remote 未到達の commit 数で代用する (多めに数え archive 側に倒れる)。
+    """
+    revs = [f"{base}..HEAD"] if base else ["HEAD", "--not", "--remotes"]
+    count = run_git(path, *SAFE_GIT, "rev-list", "--count", *revs, env=GIT_PROBE_ENV)
+    status = run_git(path, *SAFE_GIT, "status", "--porcelain", env=GIT_PROBE_ENV)
+    return {"commits": int(count) if count and count.isdigit() else None,
+            "dirty": None if status is None else count_porcelain(status)}
+
+
+def plan_worktree_removal(probe, force_discard):
+    """worktree 削除の方針 (純関数).
+
+    remove(成果なし) / archive_remove(退避 ref を作ってから削除) /
+    refuse_dirty(未コミットあり + --force-discard なし) / inspection_failed(削除しない).
+    """
+    if probe["commits"] is None or probe["dirty"] is None:
+        return "inspection_failed"
+    if probe["dirty"] and not force_discard:
+        return "refuse_dirty"
+    return "archive_remove" if probe["commits"] or probe["dirty"] else "remove"
+
+
+def snapshot_dirty(path, head):
+    """未コミット (untracked 含む) を一時 index でコミット化し sha を返す。失敗は None."""
+    ident = ("-c", "user.name=herdr-delegate", "-c", "user.email=herdr-delegate@localhost")
+    with tempfile.TemporaryDirectory() as tmp:
+        env = {**GIT_PROBE_ENV, "GIT_INDEX_FILE": os.path.join(tmp, "index")}
+        if run_git(path, "read-tree", head, env=env) is None:
+            return None
+        if run_git(path, "add", "-A", env=env, timeout=60) is None:
+            return None
+        tree = run_git(path, "write-tree", env=env)
+        return tree and run_git(path, *ident, "commit-tree", tree, "-p", head,
+                                "-m", "herdr-delegate: dirty snapshot", env=env)
+
+
+def archive_worktree(path, task_id, probe):
+    """HEAD と (dirty なら) 作業ツリーの snapshot を refs/herdr/archive/<id>[-dirty] に残す.
+
+    成功なら作った ref 名のリスト、失敗は None (削除してはいけない)。
+    """
+    head = run_git(path, "rev-parse", "HEAD")
+    ref = ARCHIVE_REF.format(task_id)
+    if not head or run_git(path, "update-ref", ref, head) is None:
+        return None
+    refs = [ref]
+    if probe["dirty"]:
+        snap = snapshot_dirty(path, head)
+        if not snap or run_git(path, "update-ref", ref + "-dirty", snap) is None:
+            return None
+        refs.append(ref + "-dirty")
+    return refs
+
+
+# ---------- snapshot (非 worktree spawn の作業前後) ----------
+
+SNAP_REF = "refs/herdr-delegate/{}/{}"
+SNAP_PREFIX = "refs/herdr-delegate/{}/"
+
+
+def parse_name_status_z(text):
+    """git diff --name-status -z --no-renames の出力 → [(status, path)]."""
+    tokens = [t for t in text.split("\0") if t]
+    return list(zip(tokens[0::2], tokens[1::2]))
+
+
+def plan_restore(changes, only=None):
+    """worker の変更 [(status, path)] から復元計画を作る純関数.
+
+    restore: pre の内容に戻す (変更/削除されたもの) / remove: worker が新規作成したので消す /
+    unknown: only に挙がったが worker が触れていないパス。only=None は全変更が対象。
+    """
+    picked = [(s, p) for s, p in changes if only is None or p in only]
+    return {"restore": [p for s, p in picked if s[0] != "A"],
+            "remove": [p for s, p in picked if s[0] == "A"],
+            "unknown": sorted(set(only or ()) - {p for _, p in changes})}
+
+
+def repo_relative(root, cwd, path):
+    """cwd 基準の path を repo ルート相対にする (symlink は解決して比較)."""
+    return os.path.relpath(os.path.realpath(os.path.join(cwd, path)), os.path.realpath(root))
+
+
+def take_snapshot(cwd, task_id, name):
+    """作業ツリー (untracked 含む) を refs/herdr-delegate/<id>/<name> に保存し sha を返す。失敗は None."""
+    head = run_git(cwd, "rev-parse", "HEAD")
+    sha = head and snapshot_dirty(cwd, head)
+    ref = SNAP_REF.format(task_id, name)
+    return sha if sha and run_git(cwd, "update-ref", ref, sha) is not None else None
+
+
+def snapshot_sha(cwd, task_id, name):
+    return run_git(cwd, "rev-parse", "--verify", "-q", SNAP_REF.format(task_id, name))
+
+
+def delete_snapshot_refs(cwd, task_id):
+    """task の snapshot ref (pre/post/pre-restore) を全て削除する."""
+    refs = run_git(cwd, "for-each-ref", "--format=%(refname)", SNAP_PREFIX.format(task_id))
+    for ref in (refs or "").splitlines():
+        run_git(cwd, "update-ref", "-d", ref)
+
+
+def snapshot_pre(args, pane, task_id):
+    """spawn 前の snapshot。非 worktree かつ git repo のときだけ取り、sha (取れなければ None)."""
+    if args.worktree is not None or not is_git_repo(pane["cwd"]):
+        return None
+    return take_snapshot(pane["cwd"], task_id, "pre")
+
+
+def snapshot_post(task_dir):
+    """終端時の snapshot (pre がある task のみ。失敗は握りつぶす)."""
+    m = load_manifest(task_dir)
+    if m.get("snapshot_pre"):
+        take_snapshot(m["cwd"], m["task_id"], "post")
+
+
+def post_state(m):
+    """worker 作業後の状態 sha: 保存済み post ref、無ければ現在の作業ツリー."""
+    return snapshot_sha(m["cwd"], m["task_id"], "post") or snapshot_dirty(
+        m["cwd"], run_git(m["cwd"], "rev-parse", "HEAD"))
+
+
+def snapshot_context(args):
+    """diff/restore の共通前提: (task_dir, manifest, repo root, pre sha, post sha). 不備は ConfigError."""
+    task_dir = task_dir_of(args.task_id)
+    m = load_manifest(task_dir)
+    pre = m.get("snapshot_pre") and snapshot_sha(m["cwd"], m["task_id"], "pre")
+    if not pre:
+        raise ConfigError("snapshot が無い task (worktree spawn / 非 git / kill 済みで GC 済み)")
+    post = post_state(m)
+    if not post:
+        raise ConfigError("現在の作業ツリーの snapshot を取れない")
+    return task_dir, m, run_git(m["cwd"], "rev-parse", "--show-toplevel"), pre, post
+
+
+def cmd_diff(args):
+    _, _, root, pre, post = snapshot_context(args)
+    out = run_git(root, "diff", "--no-renames", *(["--stat"] if args.stat else []), pre, post,
+                  timeout=60)
+    if out is None:
+        die("diff に失敗", EXIT_FAILED)
+    print(out)
+
+
+def cmd_restore(args):
+    task_dir, m, root, pre, post = snapshot_context(args)
+    if effective_state(m) == "running":
+        die("running 中の task は restore できない (wait で終端させるか kill してから)", EXIT_FAILED)
+    names = run_git(root, "diff", "--name-status", "-z", "--no-renames", pre, post, timeout=60)
+    only = [repo_relative(root, m["cwd"], f) for f in args.file] or None
+    if names is None:
+        die("diff に失敗", EXIT_FAILED)
+    plan = plan_restore(parse_name_status_z(names), only)
+    if plan["unknown"]:
+        die(f"worker が変更していないパス: {', '.join(plan['unknown'])}", EXIT_FAILED)
+    backup = take_snapshot(m["cwd"], m["task_id"], "pre-restore")
+    if not backup:
+        die("復元前の snapshot (pre-restore) を取れないため中止", EXIT_FAILED)
+    if plan["restore"] and run_git(root, "--literal-pathspecs", "restore", "--source", pre,
+                                   "--worktree", "--", *plan["restore"], timeout=60) is None:
+        die("git restore に失敗", EXIT_FAILED)
+    for path in plan["remove"]:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(os.path.join(root, path))
+    append_event(task_dir, "restore", f"restore={len(plan['restore'])} remove={len(plan['remove'])}")
+    print(json.dumps({"restored": plan["restore"], "removed": plan["remove"],
+                      "pre_restore": backup}, ensure_ascii=False))
+
+
+def git_repo_root(path):
+    """path (worktree 可) が属する本体 repo の作業ツリーのルート。特定できなければ None."""
+    common = run_git(path, "rev-parse", "--git-common-dir")
+    return os.path.dirname(os.path.normpath(os.path.join(path, common))) if common else None
+
+
+def remove_worktree_via_git(path):
+    """herdr の workspace が既に無い worktree を git で直接外す."""
+    repo = git_repo_root(path)
+    if not repo:
+        raise RuntimeError(f"git worktree remove: {path} の repo を特定できない")
+    if run_git(repo, "worktree", "remove", "--force", path) is None:
+        raise RuntimeError(f"git worktree remove --force {path} に失敗")
+
+
+def inspect_worktree(m, force_discard):
+    """--rm-worktree の事前検査: (plan, probe)。worktree が既に無ければ plan=gone."""
+    path = m["worktree_path"]
+    if not os.path.isdir(path):
+        return "gone", None
+    probe = probe_worktree(path, m.get("base_commit"))
+    return plan_worktree_removal(probe, force_discard), probe
+
+
+def cmd_kill(args):
+    task_dir = task_dir_of(args.task_id)
+    m = load_manifest(task_dir)
+    plan = probe = None
+    if args.rm_worktree and m.get("worktree_path"):
+        plan, probe = inspect_worktree(m, args.force_discard)
+        if plan == "refuse_dirty":
+            die(f"worktree に未コミット変更 {probe['dirty']} 件。破棄するなら --force-discard "
+                f"(refs/herdr/archive に退避してから削除)", EXIT_FAILED)
+    pane = get_pane(m["pane_id"])
+    if pane:
+        save_recovery(task_dir, "killed")  # pane を閉じる前に保存
+    refs = None
+    if plan == "archive_remove":
+        refs = archive_worktree(m["worktree_path"], m["task_id"], probe)
+        plan = "remove" if refs else "inspection_failed"
+    removed = plan in ("remove", "gone") and remove_task_worktree(m, pane, plan)
+    if not removed and pane:
+        hcli("pane", "close", m["pane_id"])
+
+    def mutate(man):
+        now = now_iso()
+        # killed_at より先に遷移させる (effective_state は killed_at からも killed を導くため)
+        apply_state(man, "killed", now, detail="kill", exit_reason="killed")
+        man["killed_at"] = now
+        man["delivered_at"] = man.get("delivered_at") or now  # kill は orchestrator 自身の操作
+        if removed:
+            man["worktree_removed_at"] = now
+        if refs:
+            man["archive_refs"] = refs
+        if plan == "inspection_failed":
+            man["inspection_failed"] = True
+    update_manifest(task_dir, mutate)
+    release_snapshots(args, m)
+    if plan == "inspection_failed":
+        die(f"worktree の検査/退避に失敗したため削除しなかった: {m['worktree_path']}", EXIT_FAILED)
+
+
+def release_snapshots(args, m):
+    """kill 時の snapshot: 既定は ref を GC、--keep-snapshot なら最終状態を post に残す."""
+    if not m.get("snapshot_pre"):
+        return
+    if args.keep_snapshot:
+        take_snapshot(m["cwd"], m["task_id"], "post")
+    else:
+        delete_snapshot_refs(m["cwd"], m["task_id"])
+
+
+def remove_task_worktree(m, pane, plan):
+    """worktree を外す。実際に外した (herdr/git の削除を呼んだ) なら True.
+
+    実測 (2026-07-10, smoke test): herdr worktree remove は workspace 全体 (pane 込み)
+    を畳む。先に pane close すると workspace ごと消え、後続の remove が
+    workspace_not_found で失敗するため、pane が生きていれば pane close は呼ばない。
+    pane/workspace が既に無く worktree が残っていれば git で直接外す。
+    """
+    if pane:
+        hcli("worktree", "remove", "--workspace", m["workspace_id"], "--force")
+        return True
+    if plan == "gone":
+        return False  # 既に無い
+    remove_worktree_via_git(m["worktree_path"])
+    return True
+
+
+def reconcile_all(panes_by_id):
+    """全 task を観測と突き合わせて state を更新し、更新した (task_id, state) を返す."""
+    changed = []
+    for tid, d, m in iter_manifests():
+        if m.get("pane_id") is None:  # spawn 途中の仮 manifest (diagnose_task と同じ除外)
+            continue
+        new = reconcile_state(effective_state(m), read_result_status(d),
+                              panes_by_id.get(m["pane_id"]), needs_verification(m))
+        if new and set_state(d, new, detail="reconcile"):
+            changed.append({"task_id": tid, "state": new})
+    return changed
+
+
+def undelivered_rows():
+    """running 以外で未回収 (delivered_at が null) の task。キー自体が無い旧 manifest は対象外."""
+    return [{"task_id": tid, "state": effective_state(m), "agent": m["agent"],
+             "exit_reason": m.get("exit_reason"), "finished_at": m.get("finished_at"),
+             "result": os.path.join(d, "result.md"), "label": m.get("label")}
+            for tid, d, m in iter_manifests()
+            if effective_state(m) != "running" and "delivered_at" in m and not m["delivered_at"]]
+
+
+def cmd_reconcile(args):
+    panes = hcli("pane", "list").get("panes", [])
+    changed = reconcile_all({p["pane_id"]: p for p in panes})
+    rows = undelivered_rows()
+    if args.mark_delivered:
+        for r in rows:
+            mark_delivered(os.path.dirname(r["result"]))
+    if args.json:
+        print(json.dumps({"reconciled": changed, "undelivered": rows},
+                         ensure_ascii=False, indent=2))
+        return
+    for r in rows:
+        print(f"{r['task_id']:34} {r['agent']:6} state={r['state']} "
+              f"finished={r['finished_at']} result={r['result']}")
+
+
+# ---------- health ----------
+
+def cmd_health(args):
+    now = time.time()
+    health = active_limits(load_health(), now)
+    if args.reset:
+        health = {c: e for c, e in health.items() if args.cli and c != args.cli}
+        save_health(health)
+    for cli, e in sorted(health.items()):
+        print(f"{cli:8} limited until {epoch_iso(e['until'])}  {e['reason']}")
+    if not health:
+        print("(全 CLI 正常)")
+
+
+# ---------- doctor ----------
+
+DOCTOR_MAX_RUNTIME_SECS = 7200
+DOCTOR_STRANDED_SECS = 600
+DOCTOR_REAP_AFTER_SECS = 120
+DONE_STATES = ("done", "failed")
+
+
+def diagnose_task(m, pane, result_status, now, idle_age, limits):
+    """1 task の異常所見 [{code, severity, detail}] を返す純関数 (読み取りのみ).
+
+    idle_age は最終活動からの秒数、limits は {max_runtime, stranded, reap_after}。
+    """
+    state = effective_state(m)
+    if state == "killed" or m.get("pane_id") is None:  # pane_id None は spawn 途中の仮 manifest
+        return []
+    alive = pane is not None
+    agent_status = pane.get("agent_status") if pane else None
+    finished = state in DONE_STATES or result_status in DONE_STATES
+    found = []
+
+    def add(code, severity, detail):
+        found.append({"code": code, "severity": severity, "detail": detail})
+
+    if not alive and not finished and not m.get("delivered_at") \
+            and state not in ("protocol_violation",):
+        add("crashed", "error", "pane が消え、result なし")
+    runtime = now - iso_to_epoch(m.get("created_at"))
+    if alive and state == "running" and limits["max_runtime"] and runtime > limits["max_runtime"]:
+        add("overtime", "warn", f"実行 {int(runtime)}s > --max-runtime {limits['max_runtime']}s")
+    if alive and agent_status == "idle" and not finished and state not in TERMINAL_STATES \
+            and idle_age > limits["stranded"]:
+        add("stranded", "warn", f"idle のまま result なし ({int(idle_age)}s 活動なし)")
+    if alive and finished and agent_status != "working" and idle_age > limits["reap_after"]:
+        if state in DONE_STATES or m.get("delivered_at"):
+            add("done_pane_alive", "info", f"{state} だが pane が {int(idle_age)}s 生存 (--reap で close)")
+        else:  # result だけ done。wait 未実行のまま close すると gate/検証が飛ぶので reap 対象外
+            add("done_unwaited", "info", f"result は {result_status} だが wait 未実行 (reap 対象外)")
+    if state == "protocol_violation":
+        add("protocol_violation", "warn", "Stop hook の催促を使い切っても result なし")
+    return found
+
+
+def parse_worktree_list(text):
+    """git worktree list --porcelain → 本体を除く [{"path", "branch"}]."""
+    entries = []
+    for block in (text or "").split("\n\n"):
+        fields = dict(line.split(" ", 1) for line in block.splitlines() if " " in line)
+        if "worktree" in fields:
+            branch = fields.get("branch", "").removeprefix("refs/heads/")
+            entries.append({"path": fields["worktree"], "branch": branch})
+    return entries[1:]
+
+
+def find_orphan_worktrees(worktrees, tasks):
+    """台帳と突き合わせた孤立 worktree [{path, branch, reason}] (純関数).
+
+    ledger に無い delegate/dlg-* ブランチ、または kill/gone 済みなのに残っている worktree。
+    tasks: [{"task_id", "worktree_path", "state", "removed"}]
+    """
+    by_path = {os.path.realpath(t["worktree_path"]): t for t in tasks if t.get("worktree_path")}
+    ids = {t["task_id"] for t in tasks}
+    orphans = []
+    for wt in worktrees:
+        task = by_path.get(os.path.realpath(wt["path"]))
+        if task and task["state"] in ("killed", "gone") and not task["removed"]:
+            orphans.append({**wt, "reason": f"{task['task_id']} は {task['state']} 済みで worktree が残存"})
+        elif not task and wt["branch"].startswith("delegate/dlg-") \
+                and wt["branch"].removeprefix("delegate/") not in ids:
+            orphans.append({**wt, "reason": "台帳に無い delegate ブランチ"})
+    return orphans
+
+
+def last_activity_age(m, now):
+    """最終活動からの秒数。transcript の mtime、無ければ台帳の最終 event/作成時刻."""
+    finder = codex_transcript if m.get("agent") == "codex" else claude_transcript
+    since = iso_to_epoch(m.get("created_at"))
+    found = finder(m["cwd"], since, os.path.expanduser("~"))
+    if found:
+        return now - found[1] / 1e9
+    events = m.get("events") or []
+    return now - iso_to_epoch(events[-1]["ts"] if events else m.get("created_at"))
+
+
+def ledger_worktrees():
+    """台帳上の worktree task と、それらが属する repo のルート集合."""
+    tasks, repos = [], set()
+    for tid, _, m in iter_manifests():
+        if m.get("worktree_path"):
+            tasks.append({"task_id": tid, "worktree_path": m["worktree_path"],
+                          "state": effective_state(m), "removed": bool(m.get("worktree_removed_at"))})
+            if os.path.isdir(m["worktree_path"]):
+                repos.add(git_repo_root(m["worktree_path"]))
+    return tasks, repos - {None}
+
+
+def orphan_findings(extra_repo):
+    tasks, repos = ledger_worktrees()
+    root = git_repo_root(extra_repo) if os.path.isdir(extra_repo) else None
+    worktrees = {}
+    for repo in repos | ({root} if root else set()):
+        for wt in parse_worktree_list(run_git(repo, "worktree", "list", "--porcelain")):
+            worktrees[wt["path"]] = wt
+    return [{"task_id": None, "code": "orphan_worktree", "severity": "info",
+             "detail": f"{o['path']} ({o['branch']}): {o['reason']}"}
+            for o in find_orphan_worktrees(list(worktrees.values()), tasks)]
+
+
+def cmd_doctor(args):
+    panes = {p["pane_id"]: p for p in hcli("pane", "list").get("panes", [])}
+    now = time.time()
+    limits = {"max_runtime": args.max_runtime, "stranded": args.stranded_secs,
+              "reap_after": args.reap_after}
+    findings, owner = [], {}
+    for tid, d, m in iter_manifests():
+        pane = panes.get(m["pane_id"])
+        for f in diagnose_task(m, pane, read_result_status(d), now,
+                               last_activity_age(m, now), limits):
+            findings.append({"task_id": tid, **f})
+            owner[tid] = (d, m)
+    findings += orphan_findings(args.cwd or os.getcwd())
+    reaped = []
+    if args.reap:
+        for f in [f for f in findings if f["code"] == "done_pane_alive"]:
+            d, m = owner[f["task_id"]]
+            save_recovery(d, effective_state(m))
+            hcli("pane", "close", m["pane_id"])
+            reaped.append(f["task_id"])
+        findings = [f for f in findings if f["task_id"] not in reaped or f["code"] != "done_pane_alive"]
+    if args.json:
+        print(json.dumps({"findings": findings, "reaped": reaped}, ensure_ascii=False, indent=2))
+    else:
+        for tid in reaped:
+            print(f"[reaped] {tid} pane を close")
+        for f in findings:
+            print(f"[{f['severity']}] {f['task_id'] or '-':34} {f['code']}: {f['detail']}")
+        if not findings and not reaped:
+            print("OK: 異常なし")
+    sys.exit(1 if findings else 0)
+
+
+def main():
+    import argparse
+
+    p = argparse.ArgumentParser(prog="herdr-delegate")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("spawn")
+    sp.add_argument("--agent", choices=["claude", "codex", "auto"], required=True,
+                    help="auto: 枠切れでない CLI を選ぶ (claude 既定、枠切れなら codex。fallback_from を記録)")
+    sp.add_argument("--model")
+    sp.add_argument("--worktree", nargs="?", const="", default=None,
+                    metavar="BRANCH")
+    sp.add_argument("--cwd")
+    sp.add_argument("--label")
+    sp.add_argument("--safe", action="store_true")
+    sp.add_argument("--idempotency-key", metavar="K",
+                    help="同じ K+同じ prompt なら既存 task を返す (別 prompt はエラー, 24h 保持)")
+    sp.add_argument("--schema", metavar="FILE",
+                    help="result.json の簡易スキーマ (required/properties.type)。違反は補正を1回送る")
+    sp.add_argument("--parent", metavar="ID[,ID]",
+                    help="親 task の summary/branch/git diff --stat を prompt 先頭に展開")
+    sp.add_argument("--group", metavar="NAME", help="wait --group 用のグループ名")
+    sp.add_argument("--max-concurrent", type=int, metavar="N",
+                    help="未終端 task が N 件以上なら拒否 (--group 指定時はその group 内, exit 8)")
+    sp.add_argument("--no-deny-floor", action="store_true",
+                    help="claude worker の permissions.deny フロアを付けない")
+    sp.add_argument("--verify", metavar="TEXT", help="完了の検証方法 (契約に注入。証跡必須)")
+    sp.add_argument("--constraints", metavar="TEXT", help="守る制約 (契約に注入)")
+    sp.add_argument("--stop-when", metavar="TEXT", help="止まる条件 (契約に注入)")
+    sp.add_argument("--gate", action="append", metavar="CMD",
+                    help="done 報告時に cwd で実行する決定論 gate (複数可)。失敗は出力末尾 3KB を差し戻す")
+    sp.add_argument("--gate-timeout", type=int, default=DEFAULT_GATE_TIMEOUT, metavar="SECS",
+                    help="gate 1 コマンドの制限秒数")
+    sp.add_argument("--gate-retries", type=int, default=DEFAULT_GATE_RETRIES, metavar="N",
+                    help="gate の最大試行回数。N 回失敗で failed (exit_reason=gate_failed)")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--prompt")
+    g.add_argument("--prompt-file")
+    sp.set_defaults(func=cmd_spawn)
+
+    wp = sub.add_parser("wait", help="task を待つ。複数 ID/--group なら JSON サマリを1回出力")
+    wp.add_argument("task_ids", nargs="*", metavar="task_id")
+    wp.add_argument("--group", help="spawn --group で付けた名前の task を全て待つ")
+    mode = wp.add_mutually_exclusive_group()
+    mode.add_argument("--all", action="store_true", help="全 task の終端を待つ (既定)")
+    mode.add_argument("--any", action="store_true", help="最初の終端で返す")
+    wp.add_argument("--timeout", type=int, help="ms")
+    wp.add_argument("--stall-secs", type=int, default=DEFAULT_STALL_SECS,
+                    help="working なのに進捗なしがこの秒数続いたら1回通知 (0 で無効)")
+    wp.add_argument("--stall-grace", type=int, default=DEFAULT_STALL_GRACE,
+                    help="通知後さらにこの秒数進捗なしなら exit 5 (quiet)")
+    wp.set_defaults(func=cmd_wait)
+
+    cp = sub.add_parser("collect")
+    cp.add_argument("task_id")
+    cp.set_defaults(func=cmd_collect)
+
+    sn = sub.add_parser("send")
+    sn.add_argument("task_id")
+    sn.add_argument("text")
+    sn.set_defaults(func=cmd_send)
+
+    st = sub.add_parser("status")
+    st.add_argument("task_id", nargs="?")
+    st.add_argument("--json", action="store_true")
+    st.add_argument("--active", action="store_true",
+                    help="終端 state (done/failed/gone/killed...) を除く")
+    st.add_argument("--format", choices=["text", "json", "reinject"], default="text",
+                    help="reinject: compaction 後の再注入用 (REFERENCE ONLY ヘッダ付き)")
+    st.set_defaults(func=cmd_status)
+
+    kl = sub.add_parser("kill")
+    kl.add_argument("task_id")
+    kl.add_argument("--rm-worktree", action="store_true",
+                    help="worktree も外す。成果(commit/dirty)は refs/herdr/archive/<id> に退避")
+    kl.add_argument("--force-discard", action="store_true",
+                    help="未コミット変更があっても (退避 ref を作って) worktree を外す")
+    kl.add_argument("--keep-snapshot", action="store_true",
+                    help="作業前後の snapshot ref (refs/herdr-delegate/<id>) を GC せず残す")
+    kl.set_defaults(func=cmd_kill)
+
+    hl = sub.add_parser("health", help="枠切れ中の CLI を一覧 (期限切れは自動復帰)")
+    hl.add_argument("cli", nargs="?", help="--reset の対象 CLI (省略で全て)")
+    hl.add_argument("--reset", action="store_true", help="枠切れ記録を解除")
+    hl.set_defaults(func=cmd_health)
+
+    df = sub.add_parser("diff", help="非 worktree task の作業前後の差分 (spawn 時 snapshot との比較)")
+    df.add_argument("task_id")
+    df.add_argument("--stat", action="store_true")
+    df.set_defaults(func=cmd_diff)
+
+    rs = sub.add_parser("restore", help="worker が変更したファイルを spawn 前の状態に戻す")
+    rs.add_argument("task_id")
+    rs.add_argument("--file", action="append", default=[], metavar="F",
+                    help="このファイルだけ戻す (複数可。cwd 相対)")
+    rs.set_defaults(func=cmd_restore)
+
+    rc = sub.add_parser("reconcile", aliases=["pending"],
+                        help="台帳と pane 一覧を突き合わせ、未回収の結果を列挙")
+    rc.add_argument("--mark-delivered", action="store_true")
+    rc.add_argument("--json", action="store_true")
+    rc.set_defaults(func=cmd_reconcile)
+
+    dc = sub.add_parser("doctor", help="crashed/overtime/stranded/孤立 worktree などを診断 (exit 1: 所見あり)")
+    dc.add_argument("--json", action="store_true")
+    dc.add_argument("--reap", action="store_true", help="完了済みで pane が残っている task の pane を close")
+    dc.add_argument("--max-runtime", type=int, default=DOCTOR_MAX_RUNTIME_SECS, metavar="SECS")
+    dc.add_argument("--stranded-secs", type=int, default=DOCTOR_STRANDED_SECS)
+    dc.add_argument("--reap-after", type=int, default=DOCTOR_REAP_AFTER_SECS)
+    dc.add_argument("--cwd", help="孤立 worktree 検査に含める repo (既定: カレント)")
+    dc.set_defaults(func=cmd_doctor)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except (ConfigError, HerdrUnavailable) as e:
+        die(e, EXIT_CONFIG)
+
+
+if __name__ == "__main__":
+    main()
