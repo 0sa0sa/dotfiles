@@ -1,0 +1,760 @@
+#!/usr/bin/env python3
+"""herdr-recall: Claude Code / Codex のセッション履歴を横断検索する。
+
+  herdr-recall index [--full] [--exclude-subagents]
+  herdr-recall search QUERY [--project P] [--since 7d] [--limit N] [--json]
+  herdr-recall show SESSION [--around TS] [--context N]
+  herdr-recall recent [--limit N]
+
+対象: ~/.claude/projects/**/*.jsonl, ~/.codex/sessions/**/rollout-*.jsonl
+DB  : ~/.config/herdr/recall.db (0600, SQLite FTS5。いつでも --full で再構築可能)
+user/assistant の本文だけを索引し、tool 結果や thinking は捨てる。
+herdr-delegate の台帳 (manifest.json) と cwd+時刻で突き合わせ task_id を表示する(best-effort)。
+終了コード: 0 成功 / 1 該当なし(search 0件含む)・DB なし / 2 引数不正・曖昧な SESSION
+並行実行: 索引は 1ファイル=1トランザクション(BEGIN IMMEDIATE)+ロックファイルで直列化。
+自動差分索引は時間予算と間隔で絞り、失敗時は既存 DB で読み続ける。
+標準ライブラリのみ。
+"""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from collections import namedtuple
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+CLAUDE_DIR = os.environ.get("HERDR_RECALL_CLAUDE_DIR", os.path.join(HOME, ".claude", "projects"))
+CODEX_DIR = os.environ.get("HERDR_RECALL_CODEX_DIR", os.path.join(HOME, ".codex", "sessions"))
+DB_PATH = os.environ.get("HERDR_RECALL_DB", os.path.join(HOME, ".config", "herdr", "recall.db"))
+TASKS_DIR = os.environ.get(
+    "HERDR_RECALL_TASKS_DIR", os.path.join(HOME, ".config", "herdr", "delegate", "tasks")
+)
+
+MAX_TEXT = 4000  # 1メッセージあたりの保存上限(文字)
+SNIPPET_WIDTH = 60  # ヒット位置の前後に出す文字数
+TASK_WINDOW = (-30, 900)  # manifest.created_at からセッション開始までの許容秒数(下限, 上限)
+HEAD_BYTES = 256  # 書き換え検知用に先頭から署名を取るバイト数
+DB_TIMEOUT = 30  # 他プロセスの書き込みロック待ち(秒)
+REFRESH_INTERVAL = 10  # search/show/recent の自動差分索引を省く間隔(秒)
+REFRESH_BUDGET = 10  # 自動差分索引の時間予算(秒)。超えたら残りは次回
+
+Msg = namedtuple("Msg", "ts role text")
+
+# harness が注入する疑似 user メッセージ(検索ノイズ)。先頭一致で捨てる
+INJECTED_PREFIXES = (
+    "<local-command", "<system-reminder", "caveat:", "[request interrupted",
+    "<environment_context", "<user_instructions", "# agents.md", "<permissions",
+    "<collaboration_mode", "<skills_instructions", "<turn_aborted", "<user_shell_command",
+)
+CJK_RE = re.compile("[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7af]")
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+# ---------- 純粋関数: パース ----------
+
+def is_injected(text):
+    return text.lstrip().lower().startswith(INJECTED_PREFIXES)
+
+
+def clean_text(text):
+    """空・注入文は None、それ以外は上限で切って返す。"""
+    text = text.strip()
+    if not text or is_injected(text):
+        return None
+    return text[:MAX_TEXT]
+
+
+def parse_ts(value):
+    """ISO8601(Z 可) を epoch 秒に。失敗は None。"""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def parse_claude_obj(obj):
+    """Claude Code の1行 → (cwd, Msg|None)。"""
+    if not isinstance(obj, dict):
+        return None, None
+    cwd = obj.get("cwd")
+    if obj.get("type") not in ("user", "assistant") or obj.get("isMeta") or obj.get("isApiErrorMessage"):
+        return cwd, None
+    message = obj.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, list):
+        content = "\n".join(
+            b["text"] for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+        )
+    text = clean_text(content) if isinstance(content, str) else None
+    ts = parse_ts(obj.get("timestamp"))
+    if text is None or ts is None:
+        return cwd, None
+    return cwd, Msg(ts, obj["type"], text)
+
+
+def parse_codex_obj(obj):
+    """Codex の1行 → (cwd, Msg|None)。会話は response_item の message を使う。"""
+    if not isinstance(obj, dict) or not isinstance(obj.get("payload"), dict):
+        return None, None
+    payload = obj["payload"]
+    if obj.get("type") == "session_meta":
+        return payload.get("cwd"), None
+    if obj.get("type") != "response_item" or payload.get("type") != "message":
+        return None, None
+    role = payload.get("role")
+    if role not in ("user", "assistant"):
+        return None, None
+    blocks = payload.get("content")
+    parts = [
+        clean_text(c["text"])
+        for c in (blocks if isinstance(blocks, list) else [])
+        if isinstance(c, dict) and c.get("type") in ("input_text", "output_text") and isinstance(c.get("text"), str)
+    ]
+    text = "\n".join(p for p in parts if p)
+    ts = parse_ts(obj.get("timestamp"))
+    if not text or ts is None:
+        return None, None
+    return None, Msg(ts, role, text[:MAX_TEXT])
+
+
+def claude_wanted(line):
+    """巨大な tool_result 行などを json.loads 前に捨てる軽量フィルタ。"""
+    return (b'"type":"user"' in line or b'"type":"assistant"' in line) and b'"type":"tool_result"' not in line
+
+
+def codex_wanted(line):
+    return b'"type":"message"' in line or b'"type":"session_meta"' in line
+
+
+SOURCES = {
+    "claude": (claude_wanted, parse_claude_obj),
+    "codex": (codex_wanted, parse_codex_obj),
+}
+
+
+def session_id_for(source, path):
+    """ファイルパスからセッション ID を導出する。subagent は親 ID/ファイル名。"""
+    stem = os.path.basename(path)[: -len(".jsonl")]
+    if source == "codex":
+        found = UUID_RE.findall(stem)
+        return found[-1] if found else stem
+    parts = path[: -len(".jsonl")].split(os.sep)
+    if "subagents" in parts:
+        i = parts.index("subagents")
+        return "/".join([parts[i - 1], *parts[i + 1:]])
+    return stem
+
+
+def parse_since(value, now=None):
+    """'7d' '12h' '30m' '2w' または日付(YYYY-MM-DD) を epoch 秒の下限に。不正は ValueError。"""
+    now = time.time() if now is None else now
+    m = re.fullmatch(r"(\d+)([mhdw])", value.strip())
+    if m:
+        unit = {"m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
+        return now - int(m.group(1)) * unit
+    return parse_user_time(value)
+
+
+def parse_user_time(value):
+    """epoch 数値 / ISO8601 / 'YYYY-MM-DD[ HH:MM]'(ローカル時刻) を epoch 秒に。不正は ValueError。"""
+    value = value.strip()
+    if re.fullmatch(r"\d+(\.\d+)?", value):
+        return float(value)
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"時刻を解釈できない: {value}")
+    return dt.timestamp()
+
+
+def fmt_ts(epoch):
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
+
+
+def short_path(path):
+    path = path or ""
+    return "~" + path[len(HOME):] if path == HOME or path.startswith(HOME + os.sep) else path
+
+
+# ---------- 純粋関数: 検索クエリ ----------
+
+def split_terms(query):
+    """空白区切り。"..." は1語(フレーズ)として扱う。"""
+    return [a or b for a, b in re.findall(r'"([^"]+)"|(\S+)', query)]
+
+
+def fts_capable(term, tokenizer):
+    """その語を FTS で引けるか。引けなければ LIKE に回す。"""
+    if tokenizer == "trigram":
+        return len(term) >= 3
+    return not CJK_RE.search(term) and re.search(r"\w", term) is not None
+
+
+def build_match(terms, tokenizer):
+    """語を FTS 向け(MATCH 式) と LIKE 向けに分ける。MATCH 式が空なら None。"""
+    fts = [t for t in terms if fts_capable(t, tokenizer)]
+    like = [t for t in terms if not fts_capable(t, tokenizer)]
+    expr = " AND ".join('"%s"' % t.replace('"', '""') for t in fts) or None
+    return expr, like
+
+
+def like_pattern(term):
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def make_snippet(text, terms, width=SNIPPET_WIDTH):
+    """最初にヒットした語の前後 width 文字を1行で返す。"""
+    flat = re.sub(r"\s+", " ", text)
+    lowered = flat.lower()
+    positions = [lowered.find(t.lower()) for t in terms]
+    positions = [p for p in positions if p >= 0]
+    start = max(min(positions) - width, 0) if positions else 0
+    end = start + width * 2 + (len(terms[0]) if terms else 0)
+    return ("…" if start else "") + flat[start:end] + ("…" if end < len(flat) else "")
+
+
+# ---------- 純粋関数: delegate task との突き合わせ ----------
+
+def parse_manifest_time(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def load_tasks(tasks_dir):
+    """台帳の manifest を読む。欠損キー・壊れたファイルは黙って飛ばす(読み取り専用)。"""
+    tasks = []
+    try:
+        names = sorted(os.listdir(tasks_dir))
+    except OSError:
+        return tasks
+    for name in names:
+        try:
+            with open(os.path.join(tasks_dir, name, "manifest.json"), encoding="utf-8") as f:
+                m = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(m, dict) and m.get("task_id"):
+            tasks.append(m)
+    return tasks
+
+
+def match_task(tasks, source, sid, cwd, first_ts):
+    """session_id/session_path が manifest にあれば優先、なければ agent+cwd+開始時刻 (最近接) で推定。"""
+    for m in tasks:
+        if m.get("session_id") == sid or (m.get("session_path") or "").endswith(f"{sid}.jsonl"):
+            return m["task_id"]
+    best, best_gap = None, None
+    for m in tasks:
+        started = parse_manifest_time(m.get("created_at"))
+        cwds = {m.get("cwd"), m.get("worktree_path")} - {None}
+        if (
+            m.get("agent") == source
+            and started is not None
+            and cwd in cwds
+            and first_ts is not None
+            and TASK_WINDOW[0] <= first_ts - started <= TASK_WINDOW[1]
+        ):
+            gap = abs(first_ts - started)
+            if best_gap is None or gap < best_gap:  # 同 cwd 同 agent の複数 task は開始が最も近いもの
+                best, best_gap = m["task_id"], gap
+    return best
+
+
+# ---------- DB ----------
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS files (
+  path TEXT PRIMARY KEY, source TEXT, mtime REAL, size INTEGER, offset INTEGER, sid TEXT, head TEXT);
+CREATE TABLE IF NOT EXISTS sessions (
+  sid TEXT PRIMARY KEY, source TEXT, path TEXT, cwd TEXT,
+  first_ts REAL, last_ts REAL, n INTEGER DEFAULT 0, subagent INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS msgs (
+  id INTEGER PRIMARY KEY, sid TEXT, path TEXT, ts REAL, role TEXT, text TEXT);
+CREATE INDEX IF NOT EXISTS msgs_sid_ts ON msgs (sid, ts);
+CREATE INDEX IF NOT EXISTS msgs_path ON msgs (path);
+CREATE INDEX IF NOT EXISTS msgs_ts ON msgs (ts);
+CREATE INDEX IF NOT EXISTS sessions_last ON sessions (last_ts);
+"""
+
+
+def pick_tokenizer(conn):
+    """trigram が使えれば trigram、無ければ unicode61。"""
+    try:
+        conn.execute("CREATE VIRTUAL TABLE temp._probe USING fts5(x, tokenize='trigram')")
+        conn.execute("DROP TABLE temp._probe")
+        return "trigram"
+    except sqlite3.OperationalError:
+        return "unicode61"
+
+
+class RecallConn(sqlite3.Connection):
+    """tokenizer 名を持ち回るための薄い Connection。"""
+
+    tokenizer = "trigram"
+
+
+def migrate(conn):
+    """旧スキーマの DB に後から増えた列を足す。"""
+    if "head" not in {r[1] for r in conn.execute("PRAGMA table_info(files)")}:
+        conn.execute("ALTER TABLE files ADD COLUMN head TEXT")
+        conn.commit()
+
+
+def connect(db_path=None, tokenizer=None):
+    """DB を 0600 で開き、スキーマを用意する。tokenizer 省略時は自動判定(既存 DB は保存値)。"""
+    db_path = db_path or DB_PATH
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    os.close(os.open(db_path, os.O_CREAT | os.O_RDWR, 0o600))
+    os.chmod(db_path, 0o600)
+    conn = sqlite3.connect(db_path, factory=RecallConn, timeout=DB_TIMEOUT)
+    conn.executescript(SCHEMA)
+    migrate(conn)
+    row = conn.execute("SELECT v FROM meta WHERE k='tokenizer'").fetchone()
+    if row:
+        tokenizer = row[0]
+    else:
+        tokenizer = tokenizer or pick_tokenizer(conn)
+        conn.execute("INSERT INTO meta VALUES ('tokenizer', ?)", (tokenizer,))
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5("
+            f"text, content='msgs', content_rowid='id', tokenize='{tokenizer}')"
+        )
+        conn.commit()
+    conn.tokenizer = tokenizer
+    return conn
+
+
+def head_signature(path, length):
+    """ファイル先頭 length バイトの署名 '実長:sha1'。書き換え検知に使う。"""
+    with open(path, "rb") as f:
+        data = f.read(length)
+    return f"{len(data)}:{hashlib.sha1(data).hexdigest()}"
+
+
+def head_matches(path, stored):
+    """保存済み署名と現在の先頭が一致するか。署名なし(旧 DB)は一致扱い。"""
+    if not stored:
+        return True
+    return head_signature(path, int(stored.split(":", 1)[0])) == stored
+
+
+def recompute_session(conn, sid):
+    """msgs から sessions の n/first_ts/last_ts を作り直す。"""
+    conn.execute(
+        "UPDATE sessions SET (n, first_ts, last_ts) = "
+        "(SELECT COUNT(*), MIN(ts), MAX(ts) FROM msgs WHERE sid = ?) WHERE sid = ?",
+        (sid, sid),
+    )
+
+
+def purge_path(conn, path):
+    """あるファイル由来のメッセージを FTS ごと消し、session の集計も戻す(巻き戻り/書き換え用)。"""
+    rows = conn.execute("SELECT id, text FROM msgs WHERE path=?", (path,)).fetchall()
+    sids = {r[0] for r in conn.execute("SELECT DISTINCT sid FROM msgs WHERE path=?", (path,))}
+    conn.executemany("INSERT INTO fts(fts, rowid, text) VALUES ('delete', ?, ?)", rows)
+    conn.execute("DELETE FROM msgs WHERE path=?", (path,))
+    conn.execute("DELETE FROM files WHERE path=?", (path,))
+    for sid in sids:
+        recompute_session(conn, sid)
+
+
+def read_new_messages(path, source, offset):
+    """offset 以降の完結した行だけを読み、(cwd, [Msg], 新offset) を返す。"""
+    wanted, parse = SOURCES[source]
+    cwd, msgs = None, []
+    with open(path, "rb") as f:
+        f.seek(offset)
+        for line in f:
+            if not line.endswith(b"\n"):
+                break  # 書き込み途中の行は次回に回す
+            offset += len(line)
+            if not wanted(line):
+                continue
+            try:
+                line_cwd, msg = parse(json.loads(line))
+            except (ValueError, AttributeError, TypeError):
+                continue  # 壊れた行・想定外の形は飛ばす
+            cwd = cwd or line_cwd
+            if msg:
+                msgs.append(msg)
+    return cwd, msgs, offset
+
+
+def store_messages(conn, path, source, sid, cwd, msgs):
+    for m in msgs:
+        cur = conn.execute(
+            "INSERT INTO msgs (sid, path, ts, role, text) VALUES (?,?,?,?,?)", (sid, path, m.ts, m.role, m.text)
+        )
+        conn.execute("INSERT INTO fts(rowid, text) VALUES (?, ?)", (cur.lastrowid, m.text))
+    if not msgs:
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (sid, source, path, cwd, subagent) VALUES (?,?,?,?,?)",
+            (sid, source, path, cwd, int("subagents" in path.split(os.sep))),
+        )
+        return
+    conn.execute(
+        "INSERT INTO sessions (sid, source, path, cwd, first_ts, last_ts, n, subagent) VALUES (?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(sid) DO UPDATE SET cwd=COALESCE(cwd, excluded.cwd), "
+        "first_ts=MIN(COALESCE(first_ts, excluded.first_ts), excluded.first_ts), "
+        "last_ts=MAX(COALESCE(last_ts, excluded.last_ts), excluded.last_ts), n=n+excluded.n",
+        (sid, source, path, cwd, min(m.ts for m in msgs), max(m.ts for m in msgs), len(msgs),
+         int("subagents" in path.split(os.sep))),
+    )
+
+
+def file_row(conn, path):
+    return conn.execute("SELECT mtime, size, offset, head FROM files WHERE path=?", (path,)).fetchone()
+
+
+def is_unchanged(row, st):
+    return bool(row) and (row[0], row[1]) == (st.st_mtime, st.st_size)
+
+
+def index_file(conn, path, source):
+    """1ファイルを差分索引する。追加メッセージ数を返す(変更なしは 0)。
+
+    offset の読み出しから更新までを BEGIN IMMEDIATE の中で行い、並行する索引と二重登録しない。
+    """
+    st = os.stat(path)
+    if is_unchanged(file_row(conn, path), st):
+        return 0
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        added = index_file_locked(conn, path, source, st)
+        conn.commit()
+        return added
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def index_file_locked(conn, path, source, st):
+    row = file_row(conn, path)  # 書き込みロック取得後に読み直す
+    if is_unchanged(row, st):
+        return 0
+    offset = row[2] if row else 0
+    if row and (st.st_size < offset or not head_matches(path, row[3])):
+        purge_path(conn, path)
+        offset = 0
+    sid = session_id_for(source, path)
+    cwd, msgs, new_offset = read_new_messages(path, source, offset)
+    store_messages(conn, path, source, sid, cwd, msgs)
+    conn.execute(
+        "INSERT OR REPLACE INTO files (path, source, mtime, size, offset, sid, head) VALUES (?,?,?,?,?,?,?)",
+        (path, source, st.st_mtime, st.st_size, new_offset, sid, head_signature(path, min(HEAD_BYTES, new_offset))),
+    )
+    return len(msgs)
+
+
+def iter_transcripts(claude_dir, codex_dir, exclude_subagents=False):
+    """(path, source) を列挙する。"""
+    for root, dirs, files in os.walk(claude_dir):
+        if exclude_subagents:
+            dirs[:] = [d for d in dirs if d != "subagents"]
+        for name in files:
+            if name.endswith(".jsonl"):
+                yield os.path.join(root, name), "claude"
+    for root, _dirs, files in os.walk(codex_dir):
+        for name in files:
+            if name.startswith("rollout-") and name.endswith(".jsonl"):
+                yield os.path.join(root, name), "codex"
+
+
+def index_all(conn, claude_dir=None, codex_dir=None, exclude_subagents=False, budget=None):
+    """全 transcript を差分索引し、統計 dict を返す。
+
+    budget(秒)を超えたら打ち切り stats["truncated"] を立てる。1ファイルの失敗は errors に数えて続行。
+    """
+    started = time.time()
+    stats = {"files": 0, "updated": 0, "messages": 0, "errors": 0, "truncated": False}
+    for path, source in iter_transcripts(claude_dir or CLAUDE_DIR, codex_dir or CODEX_DIR, exclude_subagents):
+        if budget is not None and time.time() - started > budget:
+            stats["truncated"] = True
+            break
+        stats["files"] += 1
+        try:
+            added = index_file(conn, path, source)
+        except Exception:  # 1ファイルの不調で全体を止めない
+            stats["errors"] += 1
+            continue
+        stats["messages"] += added
+        stats["updated"] += 1 if added else 0
+    if not stats["truncated"]:
+        set_meta(conn, "last_refresh", str(time.time()))
+    stats["seconds"] = round(time.time() - started, 2)
+    return stats
+
+
+def set_meta(conn, key, value):
+    conn.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, value))
+    conn.commit()
+
+
+def refresh_due(last, now, interval=REFRESH_INTERVAL):
+    """前回の索引完了(epoch 秒文字列/None)から interval 秒以上空いていれば True。"""
+    try:
+        return now - float(last) >= interval
+    except (TypeError, ValueError):
+        return True
+
+
+@contextlib.contextmanager
+def db_lock(exclusive, wait=True):
+    """DB 横の lockfile に flock。取れなければ(wait=False)False を yield。reset_db は排他、索引は共有。"""
+    fd = os.open(DB_PATH + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    mode = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (0 if wait else fcntl.LOCK_NB)
+    try:
+        try:
+            fcntl.flock(fd, mode)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
+def reset_db(db_path=None):
+    db_path = db_path or DB_PATH
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        try:
+            os.remove(db_path + suffix)
+        except FileNotFoundError:
+            pass
+
+
+# ---------- クエリ ----------
+
+def search(conn, query, project=None, since=None, limit=20):
+    """該当メッセージを行 dict のリストで返す(関連度順。FTS を使わない時は新しい順)。"""
+    terms = split_terms(query)
+    expr, like_terms = build_match(terms, conn.tokenizer)
+    sql = (
+        "SELECT m.id, m.sid, m.ts, m.role, m.text, s.cwd, s.source, s.first_ts FROM msgs m "
+        "JOIN sessions s ON s.sid = m.sid"
+    )
+    where, args = [], []
+    if expr:
+        sql += " JOIN fts ON fts.rowid = m.id"
+        where.append("fts MATCH ?")
+        args.append(expr)
+    for t in like_terms:
+        where.append("m.text LIKE ? ESCAPE '\\'")
+        args.append(like_pattern(t))
+    if project:
+        where.append("s.cwd LIKE ? ESCAPE '\\'")
+        args.append(like_pattern(project))
+    if since is not None:
+        where.append("m.ts >= ?")
+        args.append(since)
+    if not where:
+        return []
+    sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY bm25(fts), m.ts DESC" if expr else " ORDER BY m.ts DESC"
+    sql += " LIMIT ?"
+    args.append(limit)
+    cols = "id sid ts role text cwd source first_ts".split()
+    rows = [dict(zip(cols, r)) for r in conn.execute(sql, args)]
+    for r in rows:
+        r["snippet"] = make_snippet(r["text"], terms)
+    return rows
+
+
+def resolve_session(conn, prefix):
+    """SESSION 前方一致。(sid|None, 候補一覧)。"""
+    rows = conn.execute(
+        "SELECT sid FROM sessions WHERE sid = ? OR sid LIKE ? ESCAPE '\\' ORDER BY last_ts DESC LIMIT 10",
+        (prefix, like_pattern(prefix)[1:]),
+    ).fetchall()
+    sids = [r[0] for r in rows]
+    if prefix in sids:
+        return prefix, sids
+    return (sids[0] if len(sids) == 1 else None), sids
+
+
+def session_messages(conn, sid, around=None, context=5):
+    """会話を時系列で返す。around 指定時は最も近い発言の前後 context 件。(行list, 中心index|None)"""
+    rows = conn.execute("SELECT ts, role, text FROM msgs WHERE sid=? ORDER BY ts, id", (sid,)).fetchall()
+    if around is None or not rows:
+        return rows, None
+    center = min(range(len(rows)), key=lambda i: abs(rows[i][0] - around))
+    lo = max(center - context, 0)
+    return rows[lo:center + context + 1], center - lo
+
+
+def recent_sessions(conn, limit=10):
+    sql = (
+        "SELECT s.sid, s.source, s.cwd, s.first_ts, s.last_ts, s.n, "
+        "(SELECT text FROM msgs WHERE sid = s.sid AND role = 'user' ORDER BY ts LIMIT 1) "
+        "FROM sessions s WHERE s.n > 0 ORDER BY s.last_ts DESC LIMIT ?"
+    )
+    cols = "sid source cwd first_ts last_ts n first_prompt".split()
+    return [dict(zip(cols, r)) for r in conn.execute(sql, (limit,))]
+
+
+# ---------- CLI ----------
+
+def task_of(tasks, cache, source, sid, cwd, first_ts):
+    if sid not in cache:
+        cache[sid] = match_task(tasks, source, sid, cwd, first_ts)
+    return cache[sid]
+
+
+def one_line(text, width=100):
+    flat = re.sub(r"\s+", " ", text or "").strip()
+    return flat[:width] + ("…" if len(flat) > width else "")
+
+
+def refresh_quietly(conn):
+    """間隔と時間予算つきの自動差分索引。失敗・ロック競合は警告して既存 DB のまま進む。"""
+    last = conn.execute("SELECT v FROM meta WHERE k='last_refresh'").fetchone()
+    if not refresh_due(last[0] if last else None, time.time()):
+        return
+    try:
+        with db_lock(exclusive=False, wait=False) as acquired:
+            if not acquired:
+                print("警告: 別プロセスが再構築中。差分索引を省いた", file=sys.stderr)
+                return
+            index_all(conn, budget=REFRESH_BUDGET)
+    except (sqlite3.Error, OSError) as e:
+        print(f"警告: 差分索引に失敗({e})。既存 DB で続行", file=sys.stderr)
+
+
+def open_for_read(args):
+    """DB が無ければ None。あれば既定で差分索引を回してから返す。"""
+    if not os.path.exists(DB_PATH):
+        print("DB 未作成。先に `herdr-recall index` を実行", file=sys.stderr)
+        return None
+    conn = connect()
+    if not args.no_refresh:
+        refresh_quietly(conn)
+    return conn
+
+
+def cmd_index(args):
+    with db_lock(exclusive=args.full):
+        if args.full:
+            reset_db()
+        conn = connect()
+        stats = index_all(conn, exclude_subagents=args.exclude_subagents)
+    print(
+        f"files={stats['files']} updated={stats['updated']} messages={stats['messages']} "
+        f"errors={stats['errors']} seconds={stats['seconds']} tokenizer={conn.tokenizer} db={DB_PATH}"
+    )
+    return 0
+
+
+def cmd_search(args):
+    try:
+        since = parse_since(args.since) if args.since else None
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 2
+    conn = open_for_read(args)
+    if conn is None:
+        return 1
+    rows = search(conn, args.query, args.project, since, args.limit)
+    tasks, cache = load_tasks(TASKS_DIR), {}
+    for r in rows:
+        r["task_id"] = task_of(tasks, cache, r["source"], r["sid"], r["cwd"], r["first_ts"])
+    if args.json:
+        out = [{k: r[k] for k in ("sid", "source", "cwd", "ts", "role", "task_id", "snippet")} for r in rows]
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0 if rows else 1
+    for r in rows:
+        task = f" task={r['task_id']}" if r["task_id"] else ""
+        print(f"{fmt_ts(r['ts'])} {r['source']} {r['role']} {r['sid'][:8]} {short_path(r['cwd'])}{task}")
+        print(f"  {r['snippet']}")
+    if not rows:
+        print("(該当なし)")
+    return 0 if rows else 1
+
+
+def cmd_show(args):
+    try:
+        around = parse_user_time(args.around) if args.around else None
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 2
+    conn = open_for_read(args)
+    if conn is None:
+        return 1
+    sid, candidates = resolve_session(conn, args.session)
+    if sid is None:
+        print("該当セッションなし" if not candidates else "曖昧: " + ", ".join(candidates), file=sys.stderr)
+        return 1 if not candidates else 2
+    source, cwd, first_ts = conn.execute("SELECT source, cwd, first_ts FROM sessions WHERE sid=?", (sid,)).fetchone()
+    task = match_task(load_tasks(TASKS_DIR), source, sid, cwd, first_ts)
+    print(f"# {sid} {source} {short_path(cwd)}" + (f" task={task}" if task else ""))
+    msgs, center = session_messages(conn, sid, around, args.context)
+    for i, (ts, role, text) in enumerate(msgs):
+        mark = ">" if i == center else " "
+        print(f"{mark}[{fmt_ts(ts)}] {role}: {text}\n")
+    return 0
+
+
+def cmd_recent(args):
+    conn = open_for_read(args)
+    if conn is None:
+        return 1
+    tasks, cache = load_tasks(TASKS_DIR), {}
+    for s in recent_sessions(conn, args.limit):
+        task = task_of(tasks, cache, s["source"], s["sid"], s["cwd"], s["first_ts"])
+        print(
+            f"{fmt_ts(s['last_ts'])} {s['source']} {s['sid'][:8]} n={s['n']} {short_path(s['cwd'])}"
+            + (f" task={task}" if task else "")
+        )
+        print(f"  {one_line(s['first_prompt'])}")
+    return 0
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="herdr-recall", description="Claude Code / Codex 履歴の横断検索")
+    p.add_argument("--no-refresh", action="store_true", help="search/show/recent 前の差分索引を省く")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("index", help="差分索引(--full で作り直し)")
+    s.add_argument("--full", action="store_true", help="DB を作り直す")
+    s.add_argument("--exclude-subagents", action="store_true", help="subagents 配下を除外")
+    s.set_defaults(fn=cmd_index)
+
+    s = sub.add_parser("search", help="全文検索(3文字未満・CJK 短語は LIKE にフォールバック)")
+    s.add_argument("query")
+    s.add_argument("--project", help="cwd の部分一致")
+    s.add_argument("--since", help="7d / 12h / 2w / 2026-07-01 など")
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_search)
+
+    s = sub.add_parser("show", help="セッションの会話を表示")
+    s.add_argument("session", help="セッション ID(前方一致)")
+    s.add_argument("--around", help="この時刻(ISO/epoch)付近の発言のみ")
+    s.add_argument("--context", type=int, default=5, help="--around の前後件数(既定 5)")
+    s.set_defaults(fn=cmd_show)
+
+    s = sub.add_parser("recent", help="直近のセッション一覧")
+    s.add_argument("--limit", type=int, default=10)
+    s.set_defaults(fn=cmd_recent)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
