@@ -246,6 +246,22 @@ class TestTaskMatching(unittest.TestCase):
         self.assertEqual(hr.match_task([late, early], "claude", "s", "/repo", self.START + 20),
                          "dlg-early")
 
+    def test_prompt_footer_beats_time_heuristic(self):
+        # 同 cwd・同時刻に2 task: 時刻だけでは区別できないが、契約フッターの result パスで確定する
+        a = dict(self.TASK, task_id="dlg-163405-demo-impl")
+        b = dict(self.TASK, task_id="dlg-163405-demo-readme")
+        prompt = "fizz を実装\n--- 委任契約 ---\n完了したら /h/.config/herdr/delegate/tasks/dlg-163405-demo-impl/result.md に"
+        self.assertEqual(hr.match_task([b, a], "claude", "s", "/repo", self.START + 1, prompt),
+                         "dlg-163405-demo-impl")
+        # 台帳に無い task_id は無視して従来の推定へ
+        self.assertEqual(hr.task_from_prompt(prompt, {"dlg-other"}), None)
+
+    def test_cap_text_keeps_tail(self):
+        text = "a" * 9000 + "TAILMARK"
+        out = hr.cap_text(text)
+        self.assertEqual(len(out), hr.MAX_TEXT)
+        self.assertTrue(out.endswith("TAILMARK"))
+
     def test_match_by_session_keys_when_present(self):
         by_id = dict(self.TASK, session_id="sid-9")
         by_path = dict(self.TASK, task_id="dlg-2", session_path="/x/sid-8.jsonl")

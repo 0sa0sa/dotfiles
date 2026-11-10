@@ -125,12 +125,15 @@ def md_status(text):
 def parse_result_md(text):
     """result.md を {status, summary, artifacts, kind, question} に解釈する純関数.
 
-    `key:` 行から次の key 行までを値とする。artifacts は箇条書き/カンマ区切りを分解。
+    `key:` 行から次の key 行 (または markdown 見出し `## ...`) までを値とする。
+    artifacts は箇条書き/カンマ区切りを分解。
     """
     blocks, cur = {}, None
     for line in text.splitlines():
         m = _RESULT_KEY_RE.match(line)
-        if m:
+        if _HEADING_RE.match(line):
+            cur = None  # "## Verification evidence" 等の別節は値に含めない
+        elif m:
             cur = m.group(1).lower()
             blocks[cur] = [m.group(2)]
         elif cur:
@@ -145,12 +148,33 @@ def parse_result_md(text):
     }
 
 
+_HEADING_RE = re.compile(r"\s{0,3}#{1,6}\s")
+_OPEN, _CLOSE = "([（", ")]）"
+
+
+def split_top_level_commas(line):
+    """括弧の外側のカンマ (、全角含む) でだけ分割する. "a.py (new, untracked)" は1要素."""
+    parts, buf, depth = [], [], 0
+    for ch in line:
+        if ch in _OPEN:
+            depth += 1
+        elif ch in _CLOSE and depth:
+            depth -= 1
+        if ch in ",，" and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append("".join(buf))
+    return [x.strip() for x in parts if x.strip()]
+
+
 def split_artifacts(text):
     items = []
     for line in text.splitlines():
         line = re.sub(r"^\s*[-*•]\s*", "", line).strip()
         if line:
-            items.extend(x.strip() for x in line.split(",") if x.strip())
+            items.extend(split_top_level_commas(line))
     return items
 
 

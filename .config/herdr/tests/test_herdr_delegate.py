@@ -2400,6 +2400,13 @@ artifacts:
                          {"status": None, "summary": "", "artifacts": [], "kind": None,
                           "question": None})
 
+    def test_artifacts_stop_at_heading_and_keep_parens(self):
+        text = ("status: done\nsummary: ok\nartifacts:\n- /r/fizz.py (new, untracked)\n- README.md（新規、未コミット）\n"
+                "\n## Verification evidence\n実行: python3 -m unittest\nOK\n")
+        res = hd.parse_result_md(text)
+        self.assertEqual(res["artifacts"], ["/r/fizz.py (new, untracked)", "README.md（新規、未コミット）"])
+        self.assertEqual(res["status"], "done")
+
     def test_split_artifacts(self):
         self.assertEqual(hd.split_artifacts("a, b\n* c\n\n"), ["a", "b", "c"])
         self.assertEqual(hd.split_artifacts(""), [])
