@@ -1239,6 +1239,7 @@ def cmd_spawn(args):
     problems = preflight_problems(args.agent, cwd, worktree=args.worktree is not None)
     if problems:
         raise ConfigError("preflight 失敗: " + "; ".join(problems))
+    args.mission = resolve_mission(getattr(args, "mission", None))
     idem = idem_guard(args, prompt_body)
     if idem is None:
         return
@@ -1316,7 +1317,7 @@ def format_parent_section(parents):
             out.append("artifacts: " + ", ".join(p["artifacts"]))
         if p["diffstat"]:
             out.append("git diff --stat:\n" + p["diffstat"])
-    return "\n\n".join(out) + "\n\n---\n\n"
+    return "\n\n".join(out) + "\n\n<!-- /herdr-delegate:parent -->\n\n---\n\n"
 
 
 def build_manifest(args, task_id, pane, settings, deny, schema, parent_ids, snapshot_pre=None):
@@ -1328,7 +1329,7 @@ def build_manifest(args, task_id, pane, settings, deny, schema, parent_ids, snap
         "worktree_path": pane["worktree_path"],
         "worktree_branch": pane["worktree_branch"], "label": args.label,
         "created_at": now, "safe": args.safe,
-        "group": args.group, "parents": parent_ids, "schema": bool(schema),
+        "group": args.group, "mission": getattr(args, "mission", None), "parents": parent_ids, "schema": bool(schema),
         "worker_settings": settings, "deny_floor": deny,
         "contract": build_contract(args.verify, args.constraints, args.stop_when),
         "gates": list(args.gate or []), "gate_timeout": args.gate_timeout,
@@ -1381,6 +1382,77 @@ def reserve_task(args, prompt_body, cwd):
     return task_dir
 
 
+ORCH_TIMEOUT = 5
+
+
+def orch_bin():
+    """herdr-orch の場所: env HERDR_ORCH_BIN > 本ファイルと同じ dir > PATH (無ければ None)."""
+    env = os.environ.get("HERDR_ORCH_BIN")
+    if env:
+        return env if os.access(env, os.X_OK) else None
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "herdr-orch")
+    if os.access(here, os.X_OK):
+        return here
+    return shutil.which("herdr-orch")
+
+
+def run_orch(*argv):
+    """herdr-orch を best-effort で呼ぶ。成功時 stdout、失敗/timeout/不在/非0 は None."""
+    try:
+        binary = orch_bin()
+        if not binary:
+            return None
+        proc = subprocess.run([binary, *argv], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=ORCH_TIMEOUT)
+        return proc.stdout if proc.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def resolve_mission(explicit):
+    """--mission > env HERDR_MISSION > `herdr-orch mission current`。無ければ None."""
+    mid = next((c for c in (explicit, os.environ.get("HERDR_MISSION")) if c), None) \
+        or (run_orch("mission", "current") or "").strip() or None
+    if mid and orch_bin() and run_orch("mission", "show", mid) is None:
+        # typo だと context に mission 節が出ず紐付かない。保存はするが警告
+        print(f"herdr-delegate: 警告: mission '{mid}' が herdr-orch に見つからない", file=sys.stderr)
+    return mid
+
+
+def orch_context(args, task_id, prompt_body):
+    """prompt に挿入する herdr-orch context (無効/失敗/空は "")."""
+    if getattr(args, "no_orch_context", False):
+        return ""
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix="herdr-orch-prompt-", suffix=".md")
+        with os.fdopen(fd, "w") as f:
+            f.write(prompt_body)
+        argv = ["context", "--agent", args.agent, "--task", task_id, "--prompt-file", tmp]
+        if args.group:
+            argv += ["--group", args.group]
+        if getattr(args, "mission", None):
+            argv += ["--mission", args.mission]
+        return (run_orch(*argv) or "").strip()
+    except Exception:
+        return ""
+    finally:
+        if tmp:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+
+
+def orch_after_outcome(task_id, state, manifest, summary):
+    """終端後の学習フック: lessons capture と group ボードへの done 投稿 (全て best-effort)."""
+    if state not in ("done", "killed"):
+        run_orch("lessons", "capture", task_id)
+    group = manifest.get("group")
+    if group:
+        line = (summary or "").strip().splitlines()[:1]
+        run_orch("board", "post", group, "--task", task_id, "--kind", "done",
+                 f"{state}: {line[0] if line else ''}")
+
+
 def create_task(args, prompt_body, cwd):
     schema = load_schema(args.schema)
     parent_ids = [x for x in (args.parent or "").split(",") if x]
@@ -1392,7 +1464,9 @@ def create_task(args, prompt_body, cwd):
         if schema:
             atomic_write_json(os.path.join(task_dir, "schema.json"), schema)
         with open(os.path.join(task_dir, "prompt.md"), "w") as f:
+            ctx = orch_context(args, task_id, prompt_body)
             f.write(format_parent_section(parents) + prompt_body.rstrip() + "\n"
+                    + (ctx + "\n" if ctx else "")
                     + contract_footer(task_dir, schema,
                                       build_contract(args.verify, args.constraints, args.stop_when)))
         deny = [] if args.no_deny_floor or args.agent != "claude" else list(DENY_FLOOR)
@@ -1641,6 +1715,8 @@ def record_outcome(w, action):
         notify(f"delegate {w.task_id} blocked", "サブエージェントが入力待ち")
     if action in ("BLOCKED", "STALLED", "TIMEOUT", "QUIET", "PROTOCOL_VIOLATION", "LIMITED"):
         print(pane_tail(w.pane_id), file=sys.stderr)
+    orch_after_outcome(w.task_id, state, w.manifest, info.get("summary") or info.get("question")
+                       or out.get("reason"))
     return out, code
 
 
@@ -1999,6 +2075,7 @@ def cmd_status(args):
             "agent_status": pane.get("agent_status") if pane else None,
             "result": read_result_status(d),
             "cwd": m["cwd"],
+            "mission": m.get("mission"),
         })
     if fmt == "json":
         print(json.dumps(rows, ensure_ascii=False, indent=2))
@@ -2491,6 +2568,10 @@ def main():
     sp.add_argument("--parent", metavar="ID[,ID]",
                     help="親 task の summary/branch/git diff --stat を prompt 先頭に展開")
     sp.add_argument("--group", metavar="NAME", help="wait --group 用のグループ名")
+    sp.add_argument("--mission", metavar="ID",
+                    help="紐付けるミッション (既定: env HERDR_MISSION / herdr-orch mission current)")
+    sp.add_argument("--no-orch-context", action="store_true",
+                    help="herdr-orch の共有ボード/ミッション/教訓を prompt に注入しない")
     sp.add_argument("--max-concurrent", type=int, metavar="N",
                     help="未終端 task が N 件以上なら拒否 (--group 指定時はその group 内, exit 8)")
     sp.add_argument("--no-deny-floor", action="store_true",
