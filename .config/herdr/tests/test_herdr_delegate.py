@@ -13,6 +13,9 @@ import types
 import unittest
 from unittest import mock
 
+# 既存テストが実 herdr-orch / 実データを触らないよう、既定は不在の binary を指す
+os.environ["HERDR_ORCH_BIN"] = "/nonexistent/herdr-orch"
+
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "herdr-delegate")
 loader = importlib.machinery.SourceFileLoader("herdr_delegate", SCRIPT)
 spec = importlib.util.spec_from_loader("herdr_delegate", loader)
@@ -3576,6 +3579,199 @@ class TestCreateTaskSnapshot(SnapshotRepoCase):
         refs = hd.run_git(self.repo, "for-each-ref", "--format=%(refname)", "refs/herdr-delegate/")
         self.assertIn(f"refs/herdr-delegate/{tid}/pre", refs.splitlines())
         self.assertEqual(len([r for r in refs.splitlines() if r.endswith("/pre")]), 2)  # dlg-1 + 成功分のみ
+
+
+STUB_ORCH = """#!/bin/sh
+echo "$@" >> "$STUB_LOG"
+case "$1" in
+  context) [ -n "$STUB_CONTEXT" ] && printf '%s\\n' "$STUB_CONTEXT"; cat "${@: -1}" > "$STUB_LOG.prompt" 2>/dev/null;;
+  mission) [ "$2" = current ] && printf '%s\\n' "$STUB_MISSION";;
+esac
+exit ${STUB_RC:-0}
+"""
+
+
+class OrchStubMixin:
+    """tempdir に herdr-orch のスタブ sh を置き HERDR_ORCH_BIN で差し替える."""
+
+    def install_stub(self, body=STUB_ORCH, **env):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        self.stub = os.path.join(d, "herdr-orch")
+        self.stub_log = os.path.join(d, "log")
+        with open(self.stub, "w") as f:
+            f.write(body.replace("#!/bin/sh", "#!/bin/bash", 1))
+        os.chmod(self.stub, 0o755)
+        e = {"HERDR_ORCH_BIN": self.stub, "STUB_LOG": self.stub_log}
+        e.update(env)
+        p = mock.patch.dict(os.environ, e)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def calls(self):
+        if not os.path.exists(self.stub_log):
+            return []
+        return open(self.stub_log).read().splitlines()
+
+
+class TestOrchBin(unittest.TestCase):
+    def test_env_wins_and_missing_is_none(self):
+        with mock.patch.dict(os.environ, {"HERDR_ORCH_BIN": "/nonexistent/x"}):
+            self.assertIsNone(hd.orch_bin())
+            self.assertIsNone(hd.run_orch("brief"))
+
+    def test_falls_back_to_sibling_then_path(self):
+        env = {k: v for k, v in os.environ.items() if k != "HERDR_ORCH_BIN"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(hd.shutil, "which", return_value="/p/herdr-orch"), \
+             mock.patch.object(hd.os, "access", return_value=False):
+            self.assertEqual(hd.orch_bin(), "/p/herdr-orch")
+
+
+class TestResolveMission(OrchStubMixin, unittest.TestCase):
+    def test_priority(self):
+        self.install_stub(STUB_MISSION="from-current", HERDR_MISSION="")
+        self.assertEqual(hd.resolve_mission("explicit"), "explicit")
+        self.assertEqual(hd.resolve_mission(None), "from-current")
+        with mock.patch.dict(os.environ, {"HERDR_MISSION": "from-env"}):
+            self.assertEqual(hd.resolve_mission(None), "from-env")
+
+    def test_none_when_absent_or_empty(self):
+        self.install_stub(STUB_MISSION="", HERDR_MISSION="")
+        self.assertIsNone(hd.resolve_mission(None))
+        self.install_stub(STUB_RC="1", STUB_MISSION="x", HERDR_MISSION="")
+        self.assertIsNone(hd.resolve_mission(None))
+
+    def test_unknown_mission_warns_but_keeps(self):
+        import contextlib, io
+        self.install_stub(STUB_RC="1", HERDR_MISSION="")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(hd.resolve_mission("zzz"), "zzz")
+        self.assertIn("zzz", err.getvalue())
+        self.assertIn("mission show zzz", "\n".join(self.calls()))
+        self.install_stub(STUB_RC="0", HERDR_MISSION="")  # 存在すれば警告なし
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            hd.resolve_mission("ok")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_parent_section_has_end_marker(self):
+        text = hd.format_parent_section([{"task_id": "t0", "branch": None, "summary": "a\n---\nb",
+                                          "artifacts": [], "diffstat": None}])
+        self.assertTrue(text.startswith("## Parent task results"))
+        self.assertIn("<!-- /herdr-delegate:parent -->", text)
+
+    def test_timeout_is_none(self):
+        self.install_stub("#!/bin/sh\nsleep 5\n", HERDR_MISSION="")
+        with mock.patch.object(hd, "ORCH_TIMEOUT", 0.2):
+            self.assertIsNone(hd.resolve_mission(None))
+
+
+class TestOrchContextInPrompt(OrchStubMixin, CreateTaskCase):
+    def prompt(self, tid):
+        return open(os.path.join(self.tasks, tid, "prompt.md")).read()
+
+    def test_context_inserted_between_body_and_footer(self):
+        self.install_stub(STUB_CONTEXT="## 共有ボード\nCTX", HERDR_MISSION="")
+        tid, m, _ = self.create(group="g1", mission="m1")
+        text = self.prompt(tid)
+        self.assertLess(text.index("do x"), text.index("CTX"))
+        self.assertLess(text.index("CTX"), text.index("--- 委任契約 ---"))
+        self.assertEqual(m["mission"], "m1")
+        call = [c for c in self.calls() if c.startswith("context")][0]
+        for frag in ("--group g1", "--mission m1", "--agent claude", f"--task {tid}", "--prompt-file"):
+            self.assertIn(frag, call)
+
+    def test_prompt_file_holds_body_only(self):
+        self.install_stub(STUB_CONTEXT="CTX", HERDR_MISSION="")
+        self.create()
+        self.assertEqual(open(self.stub_log + ".prompt").read(), "do x")
+
+    def test_no_orch_context_skips_call(self):
+        self.install_stub(STUB_CONTEXT="CTX", HERDR_MISSION="")
+        tid, _, _ = self.create(no_orch_context=True)
+        self.assertNotIn("CTX", self.prompt(tid))
+        self.assertEqual([c for c in self.calls() if c.startswith("context")], [])
+
+    def test_failure_cases_do_not_break_spawn(self):
+        for body, env in (("#!/bin/sh\nexit 3\n", {}), ("#!/bin/sh\nsleep 5\n", {}),
+                          (None, {"HERDR_ORCH_BIN": "/nonexistent/herdr-orch"})):
+            with self.subTest(body=body):
+                self.install_stub(body or STUB_ORCH, **env)
+                with mock.patch.object(hd, "ORCH_TIMEOUT", 0.3):
+                    tid, m, m_start = self.create()
+                self.assertTrue(m_start.called)
+                self.assertIn("do x", self.prompt(tid))
+                self.assertIn("--- 委任契約 ---", self.prompt(tid))
+
+    def test_manifest_mission_defaults_none(self):
+        _, m, _ = self.create()
+        self.assertIsNone(m["mission"])
+
+
+class TestOrchAfterOutcome(OrchStubMixin, TempTaskCase):
+    def outcome(self, **manifest):
+        d = self.make_task("dlg-1", state="running", **manifest)
+        self.write_result(d, "status: done\nsummary: 完了\n二行目\n")
+        w = hd.Watcher("dlg-1", wait_args("dlg-1"))
+        with mock.patch.object(hd, "snapshot_post"), mock.patch.object(hd, "notify"):
+            return hd.record_outcome(w, self.action)
+
+    action = "FAILED_RESULT"
+
+    def test_failed_captures_lesson_and_posts_board(self):
+        self.install_stub()
+        out, code = self.outcome(group="g1")
+        calls = self.calls()
+        self.assertIn("lessons capture dlg-1", calls)
+        self.assertTrue(any(c.startswith("board post g1 --task dlg-1 --kind done") for c in calls))
+        self.assertEqual(out["state"], "failed")
+        self.assertEqual(code, hd.EXIT_FAILED)
+
+    def test_done_skips_capture_and_no_group_skips_board(self):
+        self.action = "DONE"
+        self.install_stub()
+        out, code = self.outcome()
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(code, 0)
+
+    def test_done_with_group_posts_board_only(self):
+        self.action = "DONE"
+        self.install_stub()
+        self.outcome(group="g1")
+        calls = self.calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("board post g1", calls[0])
+
+    def test_orch_failure_does_not_change_result(self):
+        for body in ("#!/bin/sh\nexit 9\n", "#!/bin/sh\nsleep 5\n"):
+            with self.subTest(body=body):
+                self.install_stub(body)
+                with mock.patch.object(hd, "ORCH_TIMEOUT", 0.3):
+                    out, code = self.outcome(group="g1")
+                    self.tearDownTask()
+                self.assertEqual((out["state"], code), ("failed", hd.EXIT_FAILED))
+
+    def tearDownTask(self):
+        shutil.rmtree(os.path.join(self.tasks, "dlg-1"), ignore_errors=True)
+
+    def test_missing_binary_is_fine(self):
+        out, code = self.outcome(group="g1")
+        self.assertEqual(out["state"], "failed")
+
+
+class TestSpawnMission(OrchStubMixin, unittest.TestCase):
+    def test_cmd_spawn_resolves_mission_from_current(self):
+        self.install_stub(STUB_MISSION="cur", HERDR_MISSION="")
+        args = types.SimpleNamespace(
+            prompt="x", prompt_file=None, cwd="/tmp", agent="claude", worktree=None,
+            gate_retries=3, gate_timeout=300, idempotency_key=None, mission=None)
+        with mock.patch.object(hd, "resolve_agent", return_value=("claude", None)), \
+             mock.patch.object(hd, "preflight_problems", return_value=[]), \
+             mock.patch.object(hd, "create_task") as m_create:
+            hd.cmd_spawn(args)
+        self.assertEqual(m_create.call_args.args[0].mission, "cur")
 
 
 if __name__ == "__main__":
