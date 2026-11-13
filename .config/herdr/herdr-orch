@@ -744,15 +744,23 @@ def cmd_mission_current(a):
 # ---------- manifest / result / classify ----------
 
 _KIND_RULES = (
-    ("review", ("レビュー", "review", "指摘")),
+    ("review", ("レビュー", "review", "指摘", "査読")),
     ("fix", ("修正", "バグ", "不具合", "fix", "bug")),
     ("refactor", ("リファクタ", "rename", "refactor", "リネーム")),
     ("test", ("テスト", "test")),
-    ("research", ("調査", "調べ", "investigate", "research", "分析", "analy")),
+    ("research", ("調査", "調べ", "investigate", "research", "分析", "analyze", "analyse", "analysis")),
     ("docs", ("ドキュメント", "readme", "docs", "documentation")),
-    ("implement", ("実装", "追加", "implement", "add ", "add\n", "新規", "作成")),
+    ("implement", ("実装", "追加", "implement", "add", "新規", "作成", "作り", "作って", "書け", "書いて",
+                   "create", "write")),
 )
-
+# 複数の「依頼の動詞」が並んだときの優先 (書き込みを伴う重い作業を優先)
+_KIND_PRIORITY = ("implement", "fix", "refactor", "test", "review", "research", "docs")
+_JP_VERB_RE = re.compile(r"(?:して|せよ|しろ|する|し[、,]|してほしい|してください|をお願い|お願い|を行)")
+_JP_IMPERATIVE = frozenset({"作って", "書け", "書いて"})  # 語自体が命令形
+_JP_END_RE = re.compile(r"\s*(?:[。.!！]|$)")
+_JP_NEG_RE = re.compile(r"(?:は|を|も)?(?:不要|しない|せず|禁止|しなくて|なし|不可)")
+_EN_NEG_RE = re.compile(r"(?:\bdon'?t|\bdo not|\bno|\bwithout|\bnever|\bnot)\s+(?:\w+\s+){0,1}$")
+_EN_LEAD_RE = re.compile(r"(?:^|[.!?:;\n]\s*|\bplease\s+|\bto\s+|[-*]\s+)$")
 
 def strip_prompt(text):
     """委任契約フッター・親タスク節・注入済み context を除いた本文."""
@@ -772,28 +780,54 @@ def strip_prompt(text):
     return text
 
 
-def _find_word(low, w):
-    """ASCII 語は直前が英数字でない位置のみ一致 (latest/prefix/preview の誤検出防止)。CJK は部分一致."""
+def _hits(low, w):
+    """語 w の出現位置 (ASCII は語境界 + 複数形/活用 s/es/ed/ing のみ許容、CJK は部分一致)."""
     if not w.isascii():
-        return low.find(w)
-    m = re.search(r"(?<![a-z0-9])" + re.escape(w), low)
-    return m.start() if m else -1
+        return [m.start() for m in re.finditer(re.escape(w), low)]
+    pat = r"(?<![a-z0-9])" + re.escape(w) + r"(?:s|es|ed|d|ing)?(?![a-z0-9])"
+    return [m.start() for m in re.finditer(pat, low)]
+
+
+def _hit_kind(low, w, p):
+    """出現 1 件を strong (依頼の動詞) / weak (話題として言及) / None (否定) に分類."""
+    after = low[p + len(w):p + len(w) + 12]
+    if w.isascii():
+        after = re.sub(r"^[a-z]*", "", after)
+        if _EN_NEG_RE.search(low[max(0, p - 16):p]):
+            return None
+        return "strong" if _EN_LEAD_RE.search(low[max(0, p - 12):p]) else "weak"
+    if _JP_NEG_RE.match(after):
+        return None
+    if w in _JP_IMPERATIVE:
+        return "strong"
+    if _JP_VERB_RE.match(after):
+        return "strong"
+    # 「原因を調査」のように目的語 (を) の直後で文が終わる体言止めも依頼とみなす
+    if _JP_END_RE.match(after) and low[:p].rstrip().endswith("を"):
+        return "strong"
+    return "weak"
 
 
 def classify(text):
     """プロンプト → review|fix|implement|refactor|test|research|docs|other.
 
-    最初に出現した語が最も早い分類を採用 (テキスト先頭の動詞を優先)。
+    依頼の動詞として使われた語 (「レビューして」「原因を調査」「Fix the ...」) を優先し、
+    複数あれば _KIND_PRIORITY 順。無ければ話題として最初に出た語。否定 (修正不要 / don't fix) は無視。
     """
-    low = strip_prompt(text).lower() + "\n"
-    best, pos = "other", None
+    low = strip_prompt(text).lower()
+    strong, first, pos = set(), "other", None
     for kind, words in _KIND_RULES:
         for w in words:
-            p = _find_word(low, w)
-            if p >= 0 and (pos is None or p < pos):
-                best, pos = kind, p
-    return best
-
+            for p in _hits(low, w):
+                k = _hit_kind(low, w, p)
+                if k == "strong":
+                    strong.add(kind)
+                elif k == "weak" and (pos is None or p < pos):
+                    first, pos = kind, p
+    for kind in _KIND_PRIORITY:
+        if kind in strong:
+            return kind
+    return first
 
 def task_prompt_text(tdir):
     return read_text(os.path.join(tdir, "prompt.md")) or ""

@@ -443,6 +443,28 @@ class TestReviewFixes(Env):
         self.assertEqual(c("run tests"), "test")
         self.assertEqual(c("fixes the bug"), "fix")
 
+    def test_classify_intent_and_negation(self):
+        c = ho.classify
+        cases = {
+            "herdr-orch の CLI 実装をレビューして問題点を指摘": "review",
+            "herdr-orch のテストクラスを調査して一覧化": "research",
+            "READMEをレビューして。変更不要": "review",
+            "バグの原因だけ調査して。修正不要": "research",
+            "Summarize the testimony": "other",
+            "Review the README": "review",
+            "Don't fix it, just investigate the crash": "research",
+            "調査して修正して": "fix",
+            "Please add a flag and update docs": "implement",
+            "テストを追加して": "implement",
+            "the login bug: fix it": "fix",
+            "a.txt に素数を書け": "implement",
+            "ping.txt を作り中身を pong にせよ。": "implement",
+            "1+1 を計算して結果だけ report せよ。ファイル作成不要。": "other",
+        }
+        for text, want in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(c(text), want)
+
     def test_strip_prompt_markers_only(self):
         # 本文中の日本語見出しでは切らない
         self.assertEqual(ho.classify("調査して\n## ミッション\n実装"), "research")
